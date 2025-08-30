@@ -110,7 +110,7 @@ def fetch_jira_issues(base_url: str, email: str, api_token: str, jql: str, field
     normalized_fields = normalize_fields(fields)
     issues = []
     start_at = 0
-    url = f"{base_url}/rest/api/3/search"
+    url = f"{base_url}/rest/api/3/search/jql" 
     headers, auth = jira_auth_headers(email, api_token)
 
     while True:
