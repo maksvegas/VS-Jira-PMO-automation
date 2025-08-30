@@ -22,4 +22,10 @@ jobs:
           JIRA_JQL: ${{ secrets.JIRA_JQL }}
           JIRA_FIELDS: ${{ secrets.JIRA_FIELDS }}
           TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
+          TITLE: "Weekly Jira Report"
+          TIMEZONE: "UTC"
+          # Optional extras:
+          # EXPAND: "changelog"
+          # RECONCILE_ISSUE_IDS: "10001,10042"
+          # JIRA_USE_LEGACY: "true"
         run: python jira_to_teams_report.py
