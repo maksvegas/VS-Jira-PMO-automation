@@ -14,7 +14,7 @@ jobs:
         with:
           python-version: "3.11"
       - run: pip install requests
-      - name: Run Jira to Teams report
+      - name: Run Jira to Teams report (safe)
         env:
           JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
@@ -28,4 +28,8 @@ jobs:
           # EXPAND: "changelog"
           # RECONCILE_ISSUE_IDS: "10001,10042"
           # JIRA_USE_LEGACY: "true"
-        run: python jira_to_teams_report.py
+          # reliability knobs:
+          TEAMS_MESSAGE_MODE: "plain"   # try "plain" first; switch back to "card" if you like
+          TEAMS_PROBE: "true"
+          TEAMS_CHUNK_LIMIT: "10000"
+        run: python jira_to_teams_report_safe.py
