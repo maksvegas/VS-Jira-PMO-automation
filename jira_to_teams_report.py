@@ -226,7 +226,7 @@ def post_to_teams(webhook_url: str, title: str, markdown_text: str) -> None:
         "text": markdown_text
     }
     resp = requests.post(webhook_url, json=payload, timeout=30)
-    if resp.status_code not in (200, 201, 204):
+    if not (200 <= resp.status_code < 300):
         raise RuntimeError(f"Teams webhook error {resp.status_code}: {resp.text}")
 
 def main():
