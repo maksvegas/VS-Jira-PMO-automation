@@ -19,8 +19,8 @@ Env (optional):
   RECONCILE_ISSUE_IDS="10001,10042"
   GROUP_BY_PARENT="true"
   GROUP_STRIP_PARENT_SUMMARY="true"
-  PARENT_RANK_FIELD="customfield_10015"   # parent Rank field (default Jira Cloud Rank)
-  ISSUE_RANK_FIELD="customfield_10015"    # child issue Rank field (usually same as parent)
+  PARENT_RANK_FIELD="customfield_10019"   # parent Rank field (default Jira Cloud Rank)
+  ISSUE_RANK_FIELD="customfield_10019"    # child issue Rank field (usually same as parent)
   SORT_CHILDREN_BY_RANK="true"            # sort issues within each parent by issue Rank
 """
 
@@ -54,8 +54,8 @@ CONFIG = {
     "RECONCILE_ISSUE_IDS": "",
     "GROUP_BY_PARENT": "true",
     "GROUP_STRIP_PARENT_SUMMARY": "true",
-    "PARENT_RANK_FIELD": "customfield_10015",
-    "ISSUE_RANK_FIELD": "customfield_10015",
+    "PARENT_RANK_FIELD": "customfield_10019",
+    "ISSUE_RANK_FIELD": "customfield_10019",
     "SORT_CHILDREN_BY_RANK": "true",
 }
 
@@ -93,7 +93,7 @@ def compute_request_fields(fields: List[str]) -> List[str]:
             req.append("parent")
 
     if parse_bool(env_or_config("SORT_CHILDREN_BY_RANK") or "true", default=True):
-        issue_rank_field = env_or_config("ISSUE_RANK_FIELD") or "customfield_10015"
+        issue_rank_field = env_or_config("ISSUE_RANK_FIELD") or "customfield_10019"
         if issue_rank_field not in req:
             req.append(issue_rank_field)
 
@@ -298,7 +298,7 @@ def group_issues_by_parent(issues: List[Dict[str, Any]], issue_rank_field: str) 
                 ptitle = parent.get("_summary_cache", "")
             # parent rank (try embedded default rank field or cached)
             pf = parent.get("fields") or {}
-            prank = pf.get("customfield_10015") or parent.get("_rank_cache", "")
+            prank = pf.get("customfield_10019") or parent.get("_rank_cache", "")
         else:
             pkey = "NO_PARENT"; ptitle = ""; prank = ""
         if pkey not in groups:
@@ -326,7 +326,7 @@ def build_markdown_table(issues: List[Dict[str, Any]], fields: List[str], tzname
     return "\n".join(rows)
 
 def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzname: str, datefmt: str,
-                           strip_parent_summary: bool = True, issue_rank_field: str = "customfield_10015") -> str:
+                           strip_parent_summary: bool = True, issue_rank_field: str = "customfield_10019") -> str:
     if not issues:
         return "_No issues found for the given JQL._"
     groups = group_issues_by_parent(issues, issue_rank_field)
@@ -410,8 +410,8 @@ def main():
     reconcile_ids = parse_reconcile_ids(env_or_config("RECONCILE_ISSUE_IDS") or "")
     group_by_parent = parse_bool(env_or_config("GROUP_BY_PARENT") or "true", default=True)
     strip_parent_summary = parse_bool(env_or_config("GROUP_STRIP_PARENT_SUMMARY") or "true", default=True)
-    parent_rank_field = env_or_config("PARENT_RANK_FIELD") or "customfield_10015"
-    issue_rank_field = env_or_config("ISSUE_RANK_FIELD") or "customfield_10015"
+    parent_rank_field = env_or_config("PARENT_RANK_FIELD") or "customfield_10019"
+    issue_rank_field = env_or_config("ISSUE_RANK_FIELD") or "customfield_10019"
     sort_children = parse_bool(env_or_config("SORT_CHILDREN_BY_RANK") or "true", default=True)
 
     missing = [n for n, v in [("JIRA_BASE_URL", base), ("JIRA_EMAIL", email), ("JIRA_API_TOKEN", token),
