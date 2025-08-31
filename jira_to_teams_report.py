@@ -1,18 +1,11 @@
 #!/usr/bin/env python3
 """
-jira_to_teams_report.py (parent rank fixes: Epic Rank support + robust ordering)
+jira_to_teams_report.py — parent rank fix (always enrich), epic-aware, child-rank sorting
 
-Adds:
-- PARENT_EPIC_RANK_FIELD (optional): use this rank field for Epic parents.
-- AUTO_DETECT_EPIC_RANK (default true): discover Epic Rank field id from /rest/api/3/field.
-- USE_EPIC_RANK_FOR_EPICS (default true): if parent issuetype is Epic, prefer Epic Rank over Rank.
-- DEBUG_ORDER prints which field was used per parent for ordering.
-
-Keeps:
-- Enhanced JQL search + legacy fallback
-- Teams webhook posting
-- parentSummary enrichment
-- Group-by-parent with child issues sorted by their own Rank
+- Always fetches parent rank for **all** parents (not just when summary is missing).
+- Epic-aware: optional Epic Rank field, auto-detected when available.
+- Orders parent groups by parent rank; falls back to min child rank; then key.
+- Orders children by their own Rank.
 """
 
 import os, sys, json
@@ -74,7 +67,6 @@ def jira_auth(email: str, token: str):
     return {"Accept":"application/json","Content-Type":"application/json"}, (email, token)
 
 def detect_fields(base: str, email: str, token: str, debug=False) -> Dict[str, str]:
-    """Return {'rank': id?, 'epic_rank': id?} by scanning /field metadata."""
     found = {"rank": "", "epic_rank": ""}
     try:
         url = f"{base}/rest/api/3/field"
@@ -84,7 +76,6 @@ def detect_fields(base: str, email: str, token: str, debug=False) -> Dict[str, s
             if debug: print(f"Field discovery failed: {r.status_code}")
             return found
         arr = r.json()
-        # Look for Rank
         for f in arr:
             name = (f.get("name") or "").strip().lower()
             fid = f.get("id") or ""
@@ -92,24 +83,20 @@ def detect_fields(base: str, email: str, token: str, debug=False) -> Dict[str, s
             t = (schema.get("type") or "").lower()
             c = (schema.get("custom") or "").lower()
             if name == "rank" and (t == "string" or "rank" in c or "lexorank" in c or "rank" in fid.lower()):
-                found["rank"] = fid
-                break
+                found["rank"] = fid; break
         if not found["rank"]:
             for f in arr:
                 fid = f.get("id") or ""
                 c = ((f.get("schema") or {}).get("custom") or "").lower()
                 if "lexorank" in c or "rank" in c:
-                    found["rank"] = fid
-                    break
-        # Look for Epic Rank
+                    found["rank"] = fid; break
         for f in arr:
             name = (f.get("name") or "").strip().lower()
             fid = f.get("id") or ""
             schema = f.get("schema") or {}
             c = (schema.get("custom") or "").lower()
             if "epic rank" in name or "epic-rank" in c or "epicrank" in c:
-                found["epic_rank"] = fid
-                break
+                found["epic_rank"] = fid; break
         if debug:
             print(f"Field discovery -> rank={found['rank'] or '(none)'} epic_rank={found['epic_rank'] or '(none)'}")
     except Exception as e:
@@ -189,14 +176,13 @@ def fetch_legacy(base: str, email: str, token: str, jql: str, req_fields: List[s
 
 def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[Dict[str, Any]],
                                parent_rank_field: str, epic_rank_field: str) -> None:
+    """Fetch summary + rank(s) for **all** parents referenced by the issues."""
     want_keys = set()
     for iss in issues:
         fields = iss.get("fields") or {}
         parent = fields.get("parent")
-        if isinstance(parent, dict):
-            embedded = isinstance(parent.get("fields"), dict) and parent["fields"].get("summary")
-            if not embedded and parent.get("key"):
-                want_keys.add(parent["key"])
+        if isinstance(parent, dict) and parent.get("key"):
+            want_keys.add(parent["key"])
     if not want_keys: return
     url = f"{base}/rest/api/3/search"
     headers, auth = jira_auth(email, token)
@@ -231,12 +217,10 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
 
 def extract_field(issue: Dict[str, Any], field: str, tzname: str, datefmt: str) -> str:
     f = field.lower()
-    if f == "key":
-        return issue.get("key", "")
+    if f == "key": return issue.get("key", "")
     fields = issue.get("fields", {})
 
-    if f == "summary":
-        return fields.get("summary", "") or ""
+    if f == "summary": return fields.get("summary", "") or ""
     if f == "status":
         st = fields.get("status") or {}
         return (st.get("name") or st.get("statusCategory", {}).get("name") or "") or ""
@@ -280,14 +264,15 @@ def group_issues_by_parent(issues: List[Dict[str, Any]], issue_rank_field: str,
             pkey = parent.get("key") or "NO_PARENT"
             pf = parent.get("fields") or {}
             ptitle = (pf.get("summary") or parent.get("_summary_cache", "") or "")
-            ptype = ((pf.get("issuetype") or {}).get("name") or (parent.get("fields") or {}).get("issuetype", {}) or "")
-            if isinstance(ptype, dict): ptype = ptype.get("name") or ""
-            # choose rank for parent
-            prank_main = pf.get(parent_rank_field) or parent.get("_rank_cache", "") or ""
-            prank_epic = pf.get(epic_rank_field) or parent.get("_epic_rank_cache", "") or ""
-            if use_epic_rank and (str(ptype).lower() == "epic") and prank_epic:
-                prank = prank_epic
-                prank_source = "epic"
+            # get parent issuetype name if available
+            ptype = (pf.get("issuetype") or {}).get("name") if isinstance(pf.get("issuetype"), dict) else ""
+            # rank sources
+            prank_main = (pf.get(parent_rank_field) if parent_rank_field else None) or parent.get("_rank_cache", "") or ""
+            prank_epic = (pf.get(epic_rank_field) if epic_rank_field else None) or parent.get("_epic_rank_cache", "") or ""
+            prank = ""
+            prank_source = ""
+            if use_epic_rank and str(ptype).lower() == "epic" and prank_epic:
+                prank = prank_epic; prank_source = "epic"
             else:
                 prank = prank_main or prank_epic
                 prank_source = "rank" if prank_main else ("epic" if prank_epic else "")
@@ -445,7 +430,7 @@ def main():
     else:
         issues = fetch_enhanced(base, email, token, jql, req_fields, max_issues, batch_size, expand, reconcile_ids)
 
-    # Enrich with summary + ranks for parents
+    # Always enrich ALL parent ranks (and summaries)
     if any(f.lower() in {"parentsummary", "parent_summary"} for f in fields) or group_by_parent:
         bulk_fill_parent_summaries(base, email, token, issues, parent_rank_field, epic_rank_field)
 
