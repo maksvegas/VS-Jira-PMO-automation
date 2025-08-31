@@ -53,6 +53,7 @@ jobs:
           DEBUG_ORDER: "true"
           DEBUG_PARENT_PRIORITY: "true"
           PARENT_PRIORITY_AGG: "min" 
+          PARENT_ENRICH_FORCE_GET: "true"
         run: python jira_to_teams_report.py
       - name: Probe one parent for Priority Rank
         env:
