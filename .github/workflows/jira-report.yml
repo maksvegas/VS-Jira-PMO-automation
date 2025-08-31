@@ -51,6 +51,8 @@ jobs:
           CHILD_RANK_DIRECTION: "asc"     # leave as asc unless you prefer the reverse
           # Temporary: print ordering to logs
           DEBUG_ORDER: "true"
+          DEBUG_PARENT_PRIORITY: "true"
+          PARENT_PRIORITY_AGG: "min" 
         run: python jira_to_teams_report.py
       - name: Probe one parent for Priority Rank
         env:
