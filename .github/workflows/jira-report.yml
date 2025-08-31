@@ -32,6 +32,11 @@ jobs:
           TEAMS_MESSAGE_MODE: "plain"   # try "plain" first; switch back to "card" if you like
           TEAMS_PROBE: "false"
           TEAMS_CHUNK_LIMIT: "10000"
+          PARENT_PRIORITY_FIELD: "customfield_10487"
+          PARENT_PRIORITY_DIRECTION: "asc"   # smaller number = higher priority
+          # (optional) if you want to use same field for children too:
+          CHILD_PRIORITY_FIELD: "customfield_10487"
+          CHILD_PRIORITY_DIRECTION: "asc"        
           # Rank fields (adjust if your Jira uses different IDs)
           # PARENT_RANK_FIELD: "customfield_10015"
           # ISSUE_RANK_FIELD: "customfield_10015"
