@@ -1,11 +1,53 @@
 #!/usr/bin/env python3
 """
-jira_to_teams_report.py — parent rank fix (always enrich), epic-aware, child-rank sorting
+jira_to_teams_report.py — grouped Jira → Teams report
+Ordering: explicit > numeric priority > parent rank/epic rank > min child rank > key
 
-- Always fetches parent rank for **all** parents (not just when summary is missing).
-- Epic-aware: optional Epic Rank field, auto-detected when available.
-- Orders parent groups by parent rank; falls back to min child rank; then key.
-- Orders children by their own Rank.
+Features
+- Enhanced JQL search (POST /rest/api/3/search/jql) with legacy fallback
+- Teams MessageCard posting (accepts any 2xx)
+- Parent enrichment in one call: summary + Rank + Epic Rank + numeric priority
+- Group by parent; children sorted inside each parent
+- Sorting controls:
+  • PARENT_ORDER (explicit order by keys/titles)
+  • Numeric parent priority (e.g., "Priority Rank" custom field)
+  • Parent rank / Epic rank
+  • Min child rank as fallback
+  • Configurable directions for parent rank & child rank, and numeric priority
+- Debug output to verify chosen order basis
+
+Env (required)
+  JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_JQL, JIRA_FIELDS, TEAMS_WEBHOOK_URL
+
+Key Env (optional)
+  TITLE, DATE_FORMAT, TIMEZONE, MAX_ISSUES, BATCH_SIZE
+  JIRA_USE_LEGACY="true"
+  EXPAND="changelog,renderedFields"
+  RECONCILE_ISSUE_IDS="10001,10042"
+  GROUP_BY_PARENT="true"
+  GROUP_STRIP_PARENT_SUMMARY="true"
+
+  # Rank
+  AUTO_DETECT_RANK="true"
+  AUTO_DETECT_EPIC_RANK="true"
+  PARENT_RANK_FIELD="customfield_10015"
+  PARENT_EPIC_RANK_FIELD=""
+  ISSUE_RANK_FIELD="customfield_10015"
+  PARENT_RANK_DIRECTION="desc"    # top-of-board first
+  CHILD_RANK_DIRECTION="asc"
+
+  # Numeric priority fields
+  PARENT_PRIORITY_FIELD="customfield_10487"   # e.g., "Priority Rank" (numeric)
+  PARENT_PRIORITY_DIRECTION="asc"             # 1,2,3 = high→low
+  CHILD_PRIORITY_FIELD=""
+  CHILD_PRIORITY_DIRECTION="asc"
+
+  # Explicit parent override
+  PARENT_ORDER=""                              # CSV of keys or titles
+  PARENT_ORDER_MODE="auto"                     # auto|keys|titles
+
+  # Debug
+  DEBUG_ORDER="false"
 """
 
 import os, sys, json
@@ -35,13 +77,24 @@ CONFIG = {
     "RECONCILE_ISSUE_IDS": "",
     "GROUP_BY_PARENT": "true",
     "GROUP_STRIP_PARENT_SUMMARY": "true",
+    # Rank defaults
     "PARENT_RANK_FIELD": "",
     "PARENT_EPIC_RANK_FIELD": "",
     "ISSUE_RANK_FIELD": "",
-    "SORT_CHILDREN_BY_RANK": "true",
     "AUTO_DETECT_RANK": "true",
     "AUTO_DETECT_EPIC_RANK": "true",
     "USE_EPIC_RANK_FOR_EPICS": "true",
+    "PARENT_RANK_DIRECTION": "desc",
+    "CHILD_RANK_DIRECTION": "asc",
+    # Priority defaults
+    "PARENT_PRIORITY_FIELD": "",
+    "PARENT_PRIORITY_DIRECTION": "asc",
+    "CHILD_PRIORITY_FIELD": "",
+    "CHILD_PRIORITY_DIRECTION": "asc",
+    # Explicit override
+    "PARENT_ORDER": "",
+    "PARENT_ORDER_MODE": "auto",
+    # Debug
     "DEBUG_ORDER": "false",
 }
 
@@ -76,6 +129,7 @@ def detect_fields(base: str, email: str, token: str, debug=False) -> Dict[str, s
             if debug: print(f"Field discovery failed: {r.status_code}")
             return found
         arr = r.json()
+        # Rank
         for f in arr:
             name = (f.get("name") or "").strip().lower()
             fid = f.get("id") or ""
@@ -90,6 +144,7 @@ def detect_fields(base: str, email: str, token: str, debug=False) -> Dict[str, s
                 c = ((f.get("schema") or {}).get("custom") or "").lower()
                 if "lexorank" in c or "rank" in c:
                     found["rank"] = fid; break
+        # Epic Rank
         for f in arr:
             name = (f.get("name") or "").strip().lower()
             fid = f.get("id") or ""
@@ -103,13 +158,15 @@ def detect_fields(base: str, email: str, token: str, debug=False) -> Dict[str, s
         if debug: print(f"Field discovery exception: {e}")
     return found
 
-def compute_request_fields(fields: List[str], group_by_parent: bool, issue_rank_field: str) -> List[str]:
+def compute_request_fields(fields: List[str], group_by_parent: bool, issue_rank_field: str, child_priority_field: str) -> List[str]:
     req = [f for f in fields if f.lower() != "key"]
     if any(f.lower() in {"parentsummary","parent_summary"} for f in fields) or group_by_parent:
         if "parent" not in {x.lower() for x in req}:
             req.append("parent")
     if issue_rank_field and issue_rank_field not in req:
         req.append(issue_rank_field)
+    if child_priority_field and child_priority_field not in req:
+        req.append(child_priority_field)
     return req
 
 def format_date(dt_str: str, tzname: str, fmt: str) -> str:
@@ -175,8 +232,8 @@ def fetch_legacy(base: str, email: str, token: str, jql: str, req_fields: List[s
 # ------------- Enrichment -------------
 
 def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[Dict[str, Any]],
-                               parent_rank_field: str, epic_rank_field: str) -> None:
-    """Fetch summary + rank(s) for **all** parents referenced by the issues."""
+                               parent_rank_field: str, epic_rank_field: str, parent_priority_field: str = "") -> None:
+    """Fetch summary + rank(s) + numeric priority for **all** parents referenced by the issues."""
     want_keys = set()
     for iss in issues:
         fields = iss.get("fields") or {}
@@ -189,6 +246,7 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
     fetch_fields = ["summary"]
     if parent_rank_field: fetch_fields.append(parent_rank_field)
     if epic_rank_field and epic_rank_field not in fetch_fields: fetch_fields.append(epic_rank_field)
+    if parent_priority_field and parent_priority_field not in fetch_fields: fetch_fields.append(parent_priority_field)
     payload = {"jql": "key in (" + ",".join(sorted(want_keys)) + ")",
                "fields": fetch_fields, "maxResults": len(want_keys)}
     try:
@@ -201,6 +259,7 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
             meta = {"summary": flds.get("summary", "")}
             if parent_rank_field: meta["rank"] = flds.get(parent_rank_field)
             if epic_rank_field:   meta["epic_rank"] = flds.get(epic_rank_field)
+            if parent_priority_field: meta["priority_num"] = flds.get(parent_priority_field)
             by_key[k] = meta
         for iss in issues:
             fields = iss.get("fields") or {}
@@ -210,6 +269,7 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
                 parent["_summary_cache"] = meta.get("summary", parent.get("_summary_cache", ""))
                 if "rank" in meta: parent["_rank_cache"] = meta.get("rank", parent.get("_rank_cache", None))
                 if "epic_rank" in meta: parent["_epic_rank_cache"] = meta.get("epic_rank", parent.get("_epic_rank_cache", None))
+                if "priority_num" in meta: parent["_priority_num_cache"] = meta.get("priority_num", parent.get("_priority_num_cache", None))
     except Exception:
         return
 
@@ -255,7 +315,8 @@ def extract_field(issue: Dict[str, Any], field: str, tzname: str, datefmt: str) 
     return "" if val is None else str(val)
 
 def group_issues_by_parent(issues: List[Dict[str, Any]], issue_rank_field: str,
-                           parent_rank_field: str, epic_rank_field: str, use_epic_rank: bool) -> Dict[str, Dict[str, Any]]:
+                           parent_rank_field: str, epic_rank_field: str, use_epic_rank: bool,
+                           parent_priority_field: str = "", child_priority_field: str = "") -> Dict[str, Dict[str, Any]]:
     groups: Dict[str, Dict[str, Any]] = {}
     for iss in issues:
         f = iss.get("fields") or {}
@@ -264,8 +325,17 @@ def group_issues_by_parent(issues: List[Dict[str, Any]], issue_rank_field: str,
             pkey = parent.get("key") or "NO_PARENT"
             pf = parent.get("fields") or {}
             ptitle = (pf.get("summary") or parent.get("_summary_cache", "") or "")
-            # get parent issuetype name if available
             ptype = (pf.get("issuetype") or {}).get("name") if isinstance(pf.get("issuetype"), dict) else ""
+            # numeric priority (parent)
+            pprio_val = None
+            if parent_priority_field:
+                pprio_val = pf.get(parent_priority_field)
+                if pprio_val is None:
+                    pprio_val = parent.get("_priority_num_cache", None)
+                try:
+                    pprio_val = float(pprio_val) if pprio_val is not None and pprio_val != "" else None
+                except Exception:
+                    pprio_val = None
             # rank sources
             prank_main = (pf.get(parent_rank_field) if parent_rank_field else None) or parent.get("_rank_cache", "") or ""
             prank_epic = (pf.get(epic_rank_field) if epic_rank_field else None) or parent.get("_epic_rank_cache", "") or ""
@@ -277,17 +347,26 @@ def group_issues_by_parent(issues: List[Dict[str, Any]], issue_rank_field: str,
                 prank = prank_main or prank_epic
                 prank_source = "rank" if prank_main else ("epic" if prank_epic else "")
         else:
-            pkey = "NO_PARENT"; ptitle = ""; prank = ""; prank_source = ""
+            pkey = "NO_PARENT"; ptitle = ""; prank = ""; prank_source = ""; pprio_val = None
         if pkey not in groups:
-            groups[pkey] = {"title": ptitle, "rank": prank or "", "rank_source": prank_source, "issues": []}
+            groups[pkey] = {"title": ptitle, "rank": prank or "", "rank_source": prank_source, "priority": pprio_val, "issues": []}
         if ptitle and not groups[pkey]["title"]:
             groups[pkey]["title"] = ptitle
         if prank and not groups[pkey].get("rank"):
             groups[pkey]["rank"] = prank
             groups[pkey]["rank_source"] = prank_source or groups[pkey].get("rank_source","")
-        # child rank capture
+        if pprio_val is not None and groups[pkey].get("priority") is None:
+            groups[pkey]["priority"] = pprio_val
+        # child rank + priority
         child_rank = (f.get(issue_rank_field) or "")
         iss["_child_rank_cache"] = child_rank
+        if child_priority_field:
+            cprio = f.get(child_priority_field)
+            try:
+                cprio = float(cprio) if cprio is not None and cprio != "" else None
+            except Exception:
+                cprio = None
+            iss["_child_priority_cache"] = cprio
         groups[pkey]["issues"].append(iss)
     # min child ranks for fallback
     for k, meta in groups.items():
@@ -310,29 +389,64 @@ def build_markdown_table(issues: List[Dict[str, Any]], fields: List[str], tzname
 def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzname: str, datefmt: str,
                            strip_parent_summary: bool, issue_rank_field: str,
                            parent_rank_field: str, epic_rank_field: str, use_epic_rank: bool,
-                           parent_dir: str = "desc", child_dir: str = "asc", debug=False) -> str:
+                           parent_dir: str = "desc", child_dir: str = "asc",
+                           parent_order: str = "", parent_order_mode: str = "auto",
+                           parent_priority_field: str = "", child_priority_field: str = "",
+                           parent_priority_dir: str = "asc", child_priority_dir: str = "asc",
+                           debug=False) -> str:
     if not issues:
         return "_No issues found for the given JQL._"
-    groups = group_issues_by_parent(issues, issue_rank_field, parent_rank_field, epic_rank_field, use_epic_rank)
+    groups = group_issues_by_parent(issues, issue_rank_field, parent_rank_field, epic_rank_field, use_epic_rank,
+                                    parent_priority_field=parent_priority_field, child_priority_field=child_priority_field)
+
+    # explicit order map
+    order_map = {}
+    if parent_order:
+        raw_items = [x.strip() for x in parent_order.split(",") if x.strip()]
+        for idx, item in enumerate(raw_items):
+            order_map[item.lower()] = idx
+
     fields_local = list(fields)
     if strip_parent_summary:
         fields_local = [f for f in fields_local if f.lower() not in {"parentsummary","parent_summary"}]
 
-    def sort_group_key(k: str):
-        if k == "NO_PARENT": return (1, "", "", k)
-        prank = groups[k].get("rank","")
-        min_child = groups[k].get("_min_child_rank","")
-        basis = prank or min_child or "~"
-        return (0, basis, k)
+    def explicit_index(k: str):
+        meta = groups[k]
+        title = (meta.get("title") or "").lower()
+        if parent_order_mode in ("auto","keys"):
+            if k.lower() in order_map: return order_map[k.lower()]
+        if parent_order_mode in ("auto","titles"):
+            if title and title.lower() in order_map: return order_map[title.lower()]
+        return None
 
-    ordered = sorted(groups.keys(), key=sort_group_key, reverse=(parent_dir=="desc"))
+    def sort_group_key(k: str):
+        if k == "NO_PARENT": return (9999, 0, "", k)  # always last unless explicitly listed
+        idx = explicit_index(k)
+        if idx is not None:
+            return (0, idx, "", k)
+        # numeric priority
+        pprio = groups[k].get("priority")
+        if pprio is not None:
+            adj = pprio if parent_priority_dir == "asc" else -pprio
+            return (1, adj, "", k)
+        # parent rank or min child rank
+        prank = groups[k].get("rank","") or groups[k].get("_min_child_rank","") or "~"
+        if parent_dir == "desc":
+            # invert rank by sorting on a tuple that will place lexicographically larger earlier
+            return (2, "", "".join(chr(255 - ord(c)) for c in prank), k)  # cheap invert
+        return (2, "", prank, k)
+
+    ordered = sorted(groups.keys(), key=sort_group_key)
 
     if debug:
-        print(f"Ordering with parent_rank_field={parent_rank_field or '(none)'} epic_rank_field={epic_rank_field or '(none)'} use_epic_rank={use_epic_rank} parent_dir={parent_dir} child_dir={child_dir}")
+        print(f"Ordering with parent_rank_field={parent_rank_field or '(none)'} epic_rank_field={epic_rank_field or '(none)'} use_epic_rank={use_epic_rank} parent_dir={parent_dir} child_dir={child_dir} parent_priority_field={parent_priority_field or '(none)'} child_priority_field={child_priority_field or '(none)'}")
+        if order_map:
+            print("Explicit order map detected (lower index = higher priority):")
+            print("  " + ", ".join([f"{k}:{v}" for k,v in list(order_map.items())[:30]]))
         print("Parent group order:")
         for k in ordered:
             meta = groups[k]
-            print(f"  {k}: prank={meta.get('rank','')} source={meta.get('rank_source','')} min_child={meta.get('_min_child_rank','')} title={meta.get('title','')} size={len(meta['issues'])}")
+            print(f"  {k}: priority={meta.get('priority', '')} prank={meta.get('rank','')} source={meta.get('rank_source','')} min_child={meta.get('_min_child_rank','')} title={meta.get('title','')} size={len(meta['issues'])}")
         if ordered:
             first = ordered[0]
             sample = [i.get('_child_rank_cache') for i in groups[first]['issues'][:5]]
@@ -346,7 +460,19 @@ def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzna
         sections.append(heading)
 
         children = list(meta["issues"])
-        children.sort(key=lambda it: (it.get("_child_rank_cache") or "~", it.get("key") or ""), reverse=(child_dir=="desc"))
+
+        def child_key(it):
+            cprio = it.get("_child_priority_cache")
+            if cprio is not None:
+                adj = cprio if child_priority_dir == "asc" else -cprio
+                return (0, adj, it.get("key") or "")
+            # rank fallback
+            rk = it.get("_child_rank_cache") or "~"
+            if child_dir == "desc":
+                rk = "".join(chr(255 - ord(c)) for c in rk)
+            return (1, rk, it.get("key") or "")
+
+        children.sort(key=child_key)
 
         header = " | ".join(fields_local)
         sep = " | ".join(["---"] * len(fields_local))
@@ -400,21 +526,32 @@ def main():
     parent_rank_field = env_or_config("PARENT_RANK_FIELD") or ""
     epic_rank_field = env_or_config("PARENT_EPIC_RANK_FIELD") or ""
     issue_rank_field = env_or_config("ISSUE_RANK_FIELD") or ""
-    sort_children = parse_bool(env_or_config("SORT_CHILDREN_BY_RANK") or "true", default=True)
-
     auto_detect = parse_bool(env_or_config("AUTO_DETECT_RANK") or "true", default=True)
     auto_detect_epic = parse_bool(env_or_config("AUTO_DETECT_EPIC_RANK") or "true", default=True)
     use_epic_rank = parse_bool(env_or_config("USE_EPIC_RANK_FOR_EPICS") or "true", default=True)
-    debug = parse_bool(env_or_config("DEBUG_ORDER") or "false", default=False)
+
     parent_dir = (env_or_config("PARENT_RANK_DIRECTION") or "desc").strip().lower()
     child_dir = (env_or_config("CHILD_RANK_DIRECTION") or "asc").strip().lower()
+
+    # Numeric priority fields
+    parent_priority_field = env_or_config("PARENT_PRIORITY_FIELD") or ""
+    parent_priority_dir = (env_or_config("PARENT_PRIORITY_DIRECTION") or "asc").strip().lower()
+    child_priority_field = env_or_config("CHILD_PRIORITY_FIELD") or ""
+    child_priority_dir = (env_or_config("CHILD_PRIORITY_DIRECTION") or "asc").strip().lower()
+
+    # Explicit order
+    parent_order = env_or_config("PARENT_ORDER") or ""
+    parent_order_mode = (env_or_config("PARENT_ORDER_MODE") or "auto").strip().lower()
+
+    sort_children = parse_bool(env_or_config("SORT_CHILDREN_BY_RANK") or "true", default=True)
+    debug = parse_bool(env_or_config("DEBUG_ORDER") or "false", default=False)
 
     missing = [n for n, v in [("JIRA_BASE_URL", base), ("JIRA_EMAIL", email), ("JIRA_API_TOKEN", token),
                                ("JIRA_JQL", jql), ("TEAMS_WEBHOOK_URL", webhook)] if not v]
     if missing:
         print("Missing required configuration values:", ", ".join(missing), file=sys.stderr); sys.exit(2)
 
-    # Field auto-detect
+    # Field auto-detect (Rank/Epic Rank) if not provided
     if auto_detect or auto_detect_epic:
         discovered = detect_fields(base, email, token, debug=debug)
         if auto_detect and not parent_rank_field and discovered.get("rank"):
@@ -424,7 +561,7 @@ def main():
         if auto_detect_epic and not epic_rank_field and discovered.get("epic_rank"):
             epic_rank_field = discovered["epic_rank"]
 
-    req_fields = compute_request_fields(fields, group_by_parent, issue_rank_field if sort_children else "")
+    req_fields = compute_request_fields(fields, group_by_parent, issue_rank_field if sort_children else "", child_priority_field)
 
     print(f"Querying Jira with JQL: {jql}")
     if use_legacy:
@@ -432,9 +569,9 @@ def main():
     else:
         issues = fetch_enhanced(base, email, token, jql, req_fields, max_issues, batch_size, expand, reconcile_ids)
 
-    # Always enrich ALL parent ranks (and summaries)
+    # Enrich ALL parents with summary + ranks + numeric priority
     if any(f.lower() in {"parentsummary", "parent_summary"} for f in fields) or group_by_parent:
-        bulk_fill_parent_summaries(base, email, token, issues, parent_rank_field, epic_rank_field)
+        bulk_fill_parent_summaries(base, email, token, issues, parent_rank_field, epic_rank_field, parent_priority_field)
 
     print(f"Fetched {len(issues)} issues")
 
@@ -448,6 +585,12 @@ def main():
             use_epic_rank=use_epic_rank,
             parent_dir=parent_dir,
             child_dir=child_dir,
+            parent_order=parent_order,
+            parent_order_mode=parent_order_mode,
+            parent_priority_field=parent_priority_field,
+            child_priority_field=child_priority_field,
+            parent_priority_dir=parent_priority_dir,
+            child_priority_dir=child_priority_dir,
             debug=debug
         )
     else:
