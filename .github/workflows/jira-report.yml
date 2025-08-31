@@ -32,14 +32,14 @@ jobs:
           TEAMS_MESSAGE_MODE: "plain"   # try "plain" first; switch back to "card" if you like
           TEAMS_PROBE: "false"
           TEAMS_CHUNK_LIMIT: "10000"
-            # Rank fields (adjust if your Jira uses different IDs)
-          PARENT_RANK_FIELD: "customfield_10015"
-          ISSUE_RANK_FIELD: "customfield_10015"
-            # Sort controls
+          # Rank fields (adjust if your Jira uses different IDs)
+          # PARENT_RANK_FIELD: "customfield_10015"
+          # ISSUE_RANK_FIELD: "customfield_10015"
+          # Sort controls
           GROUP_BY_PARENT: "true"
           SORT_CHILDREN_BY_RANK: "true"
           GROUP_STRIP_PARENT_SUMMARY: "true"
-
+          AUTO_DETECT_RANK: "true"   # default, but set explicitly for this test
           # Temporary: print ordering to logs
           DEBUG_ORDER: "true"
         run: python jira_to_teams_report.py
