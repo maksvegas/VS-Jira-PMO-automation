@@ -310,7 +310,7 @@ def build_markdown_table(issues: List[Dict[str, Any]], fields: List[str], tzname
 def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzname: str, datefmt: str,
                            strip_parent_summary: bool, issue_rank_field: str,
                            parent_rank_field: str, epic_rank_field: str, use_epic_rank: bool,
-                           debug=False) -> str:
+                           parent_dir: str = "desc", child_dir: str = "asc", debug=False) -> str:
     if not issues:
         return "_No issues found for the given JQL._"
     groups = group_issues_by_parent(issues, issue_rank_field, parent_rank_field, epic_rank_field, use_epic_rank)
@@ -325,10 +325,10 @@ def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzna
         basis = prank or min_child or "~"
         return (0, basis, k)
 
-    ordered = sorted(groups.keys(), key=sort_group_key)
+    ordered = sorted(groups.keys(), key=sort_group_key, reverse=(parent_dir=="desc"))
 
     if debug:
-        print(f"Ordering with parent_rank_field={parent_rank_field or '(none)'} epic_rank_field={epic_rank_field or '(none)'} use_epic_rank={use_epic_rank}")
+        print(f"Ordering with parent_rank_field={parent_rank_field or '(none)'} epic_rank_field={epic_rank_field or '(none)'} use_epic_rank={use_epic_rank} parent_dir={parent_dir} child_dir={child_dir}")
         print("Parent group order:")
         for k in ordered:
             meta = groups[k]
@@ -346,7 +346,7 @@ def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzna
         sections.append(heading)
 
         children = list(meta["issues"])
-        children.sort(key=lambda it: (it.get("_child_rank_cache") or "~", it.get("key") or ""))
+        children.sort(key=lambda it: (it.get("_child_rank_cache") or "~", it.get("key") or ""), reverse=(child_dir=="desc"))
 
         header = " | ".join(fields_local)
         sep = " | ".join(["---"] * len(fields_local))
@@ -406,6 +406,8 @@ def main():
     auto_detect_epic = parse_bool(env_or_config("AUTO_DETECT_EPIC_RANK") or "true", default=True)
     use_epic_rank = parse_bool(env_or_config("USE_EPIC_RANK_FOR_EPICS") or "true", default=True)
     debug = parse_bool(env_or_config("DEBUG_ORDER") or "false", default=False)
+    parent_dir = (env_or_config("PARENT_RANK_DIRECTION") or "desc").strip().lower()
+    child_dir = (env_or_config("CHILD_RANK_DIRECTION") or "asc").strip().lower()
 
     missing = [n for n, v in [("JIRA_BASE_URL", base), ("JIRA_EMAIL", email), ("JIRA_API_TOKEN", token),
                                ("JIRA_JQL", jql), ("TEAMS_WEBHOOK_URL", webhook)] if not v]
@@ -444,6 +446,8 @@ def main():
             parent_rank_field=parent_rank_field,
             epic_rank_field=epic_rank_field,
             use_epic_rank=use_epic_rank,
+            parent_dir=parent_dir,
+            child_dir=child_dir,
             debug=debug
         )
     else:
