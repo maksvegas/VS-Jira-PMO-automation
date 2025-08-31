@@ -29,7 +29,43 @@ jobs:
           # RECONCILE_ISSUE_IDS: "10001,10042"
           # JIRA_USE_LEGACY: "true"
           # reliability knobs:
-          TEAMS_MESSAGE_MODE: "plain"   # try "plain" first; switch back to "card" if you like
+          TEAMS_MESSAGE_MODE: "list"   # try "plain" first; !ada[ptive"
           TEAMS_PROBE: "false"
           TEAMS_CHUNK_LIMIT: "10000"
+          TEAMS_SINGLE_MESSAGE: "true"       # <— combine into one message/card
+          CHILD_LIST_FIELDS: "key,summary,status,assignee"
+          TEAMS_ADAPTIVE_ROWS_PER_CARD: "60" # adaptive safeguard
+          PARENT_PRIORITY_FIELD: "customfield_10487"
+          PARENT_PRIORITY_DIRECTION: "asc"   # smaller number = higher priority
+          # (optional) if you want to use same field for children too:
+          CHILD_PRIORITY_FIELD: "customfield_10487"
+          CHILD_PRIORITY_DIRECTION: "asc"        
+          # Rank fields (adjust if your Jira uses different IDs)
+          # PARENT_RANK_FIELD: "customfield_10015"
+          # ISSUE_RANK_FIELD: "customfield_10015"
+          # Sort controls
+          GROUP_BY_PARENT: "true"
+          SORT_CHILDREN_BY_RANK: "true"
+          USE_EPIC_RANK_FOR_EPICS: "true"    # default
+          GROUP_STRIP_PARENT_SUMMARY: "true"
+          AUTO_DETECT_RANK: "true"   # default, but set explicitly for this test
+          AUTO_DETECT_EPIC_RANK: "true"   # add this
+          PARENT_RANK_DIRECTION: "desc"   # <- new (puts top-of-board first)
+          CHILD_RANK_DIRECTION: "asc"     # leave as asc unless you prefer the reverse
+          # Temporary: print ordering to logs
+          DEBUG_ORDER: "true"
+          DEBUG_PARENT_PRIORITY: "true"
+          PARENT_PRIORITY_AGG: "min" 
+          PARENT_ENRICH_FORCE_GET: "true"
         run: python jira_to_teams_report.py
+      - name: Probe one parent for Priority Rank
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -e
+          KEY="PMO-223"   # change to one of your parent keys
+          curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            -H "Accept: application/json" \
+            "$JIRA_BASE_URL/rest/api/3/issue/$KEY?fields=customfield_10487,summary,issuetype" | jq .
