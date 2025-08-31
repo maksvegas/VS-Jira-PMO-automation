@@ -1,27 +1,24 @@
 #!/usr/bin/env python3
 """
-jira_to_teams_report.py (sorted by parent rank + child rank) — fixed
+jira_to_teams_report.py (auto-detect Rank + robust ordering)
 
-Fixes:
-- Parent group ordering now uses the configured PARENT_RANK_FIELD everywhere
-  (no hardcoded field IDs).
+New:
+- AUTO_DETECT_RANK="true" (default): discovers the Rank field ID via GET /rest/api/3/field
+  and uses it for both PARENT_RANK_FIELD and ISSUE_RANK_FIELD if you didn't set them.
+- Fallback ordering: if a parent has no rank, we order that group by the **minimum child rank**
+  (lexicographically). If children also lack ranks, we fall back to parent key.
+- DEBUG_ORDER prints which rank field IDs are used and the computed order basis.
 
-Extras:
-- DEBUG_ORDER="true" prints the parent group order with ranks and sample child ranks.
-
-Features Recap:
+Existing:
 - Enhanced JQL search + legacy fallback
-- Teams webhook posting (accept any 2xx)
-- parentSummary enrichment (bulk one-call fetch)
-- Group-by-parent; groups ordered by parent Rank; issues ordered by issue Rank
+- Teams webhook post (accepts any 2xx)
+- parentSummary enrichment
+- Group-by-parent; issues within parent sorted by issue rank
 """
 
-import os
-import sys
-import json
+import os, sys, json
 from typing import List, Dict, Any, Optional
 from datetime import datetime
-
 import requests
 
 try:
@@ -46,203 +43,179 @@ CONFIG = {
     "RECONCILE_ISSUE_IDS": "",
     "GROUP_BY_PARENT": "true",
     "GROUP_STRIP_PARENT_SUMMARY": "true",
-    "PARENT_RANK_FIELD": "customfield_10015",
-    "ISSUE_RANK_FIELD": "customfield_10015",
+    "PARENT_RANK_FIELD": "",           # left blank on purpose to allow auto-detect
+    "ISSUE_RANK_FIELD": "",
     "SORT_CHILDREN_BY_RANK": "true",
     "DEBUG_ORDER": "false",
+    "AUTO_DETECT_RANK": "true",
 }
-
-# ---------------- Helpers ----------------
 
 def env_or_config(name: str, default=None):
     return os.getenv(name, CONFIG.get(name, default))
 
 def parse_bool(v: Optional[str], default=False) -> bool:
-    if v is None:
-        return default
+    if v is None: return default
     return v.strip().lower() in {"1","true","yes","y","on"}
 
 def parse_reconcile_ids(csv: str) -> Optional[List[int]]:
-    if not csv:
-        return None
+    if not csv: return None
     ids = []
-    for token in csv.split(","):
-        t = token.strip()
-        if t and t.isdigit():
-            ids.append(int(t))
+    for t in csv.split(","):
+        t = t.strip()
+        if t.isdigit(): ids.append(int(t))
     return ids or None
 
-def compute_request_fields(fields: List[str]) -> List[str]:
+def jira_auth(email: str, token: str):
+    return {"Accept":"application/json","Content-Type":"application/json"}, (email, token)
+
+def detect_rank_field(base: str, email: str, token: str) -> Optional[str]:
+    """Return customfield id for Rank by inspecting /field metadata."""
+    try:
+        url = f"{base}/rest/api/3/field"
+        headers, auth = jira_auth(email, token)
+        r = requests.get(url, headers=headers, auth=auth, timeout=60)
+        if r.status_code != 200:
+            return None
+        for f in r.json():
+            name = (f.get("name") or "").strip().lower()
+            fid = f.get("id") or ""
+            schema = f.get("schema") or {}
+            t = (schema.get("type") or "").lower()
+            c = (schema.get("custom") or "").lower()
+            # Heuristics: field named "Rank" with type 'string' and custom key contains 'rank'
+            if name == "rank" and (t == "string" or "rank" in c or "rank" in fid.lower() or "lexorank" in c):
+                return fid
+        # fallback: first field with custom schema containing "rank"
+        for f in r.json():
+            fid = f.get("id") or ""
+            schema = f.get("schema") or {}
+            c = (schema.get("custom") or "").lower()
+            if "rank" in c or "lexorank" in c:
+                return fid
+    except Exception:
+        return None
+    return None
+
+def compute_request_fields(fields: List[str], issue_rank_field: str, group_by_parent: bool) -> List[str]:
     req = [f for f in fields if f.lower() != "key"]
-    group_by_parent = parse_bool(env_or_config("GROUP_BY_PARENT") or "true", default=True)
-    if any(f.lower() in {"parentsummary", "parent_summary"} for f in fields) or group_by_parent:
-        if "parent" not in {x.lower() for x in req}:
-            req.append("parent")
-    if parse_bool(env_or_config("SORT_CHILDREN_BY_RANK") or "true", default=True):
-        issue_rank_field = env_or_config("ISSUE_RANK_FIELD") or "customfield_10015"
-        if issue_rank_field not in req:
-            req.append(issue_rank_field)
+    if any(f.lower() in {"parentsummary","parent_summary"} for f in fields) or group_by_parent:
+        if "parent" not in {x.lower() for x in req}: req.append("parent")
+    if issue_rank_field and issue_rank_field not in req:
+        req.append(issue_rank_field)
     return req
 
 def format_date(dt_str: str, tzname: str, fmt: str) -> str:
-    if not dt_str:
-        return ""
+    if not dt_str: return ""
     try:
-        s = dt_str.replace("+0000", "+00:00")
-        if s.endswith("Z"):
-            s = s[:-1] + "+00:00"
+        s = dt_str.replace("+0000","+00:00")
+        if s.endswith("Z"): s = s[:-1] + "+00:00"
         dt = datetime.fromisoformat(s)
-        if tzname and ZoneInfo:
-            dt = dt.astimezone(ZoneInfo(tzname))
+        if tzname and ZoneInfo: dt = dt.astimezone(ZoneInfo(tzname))
         return dt.strftime(fmt)
     except Exception:
         return dt_str
 
-def jira_auth(email: str, token: str):
-    return {"Accept": "application/json", "Content-Type": "application/json"}, (email, token)
+# --------- Fetchers ---------
 
-# ------------- Fetch -------------
-
-def fetch_enhanced(base: str, email: str, token: str, jql: str, fields: List[str],
-                   max_issues: int, batch_size: int, expand: str,
-                   reconcile_ids: Optional[List[int]]) -> List[Dict[str, Any]]:
+def fetch_enhanced(base, email, token, jql, req_fields, max_issues, batch_size, expand, reconcile_ids):
     url = f"{base}/rest/api/3/search/jql"
     headers, auth = jira_auth(email, token)
-    out: List[Dict[str, Any]] = []
-    next_token: Optional[str] = None
-    req_fields = compute_request_fields(fields)
-
+    out, next_token = [], None
     while True:
         remaining = max_issues - len(out)
-        if remaining <= 0:
-            break
+        if remaining <= 0: break
         limit = min(batch_size, remaining)
-        payload: Dict[str, Any] = {
-            "jql": jql,
-            "maxResults": limit,
-            "fields": req_fields,
-        }
-        if expand:
-            payload["expand"] = expand
-        if reconcile_ids:
-            payload["reconcileIssues"] = reconcile_ids
-        if next_token:
-            payload["nextPageToken"] = next_token
-
+        payload = {"jql": jql, "maxResults": limit, "fields": req_fields}
+        if expand: payload["expand"] = expand
+        if reconcile_ids: payload["reconcileIssues"] = reconcile_ids
+        if next_token: payload["nextPageToken"] = next_token
         resp = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload), timeout=60)
         if resp.status_code != 200:
             raise RuntimeError(f"Jira API error {resp.status_code}: {resp.text}")
         data = resp.json()
-        issues = data.get("issues", [])
-        out.extend(issues)
+        out.extend(data.get("issues", []))
         next_token = data.get("nextPageToken")
-        if not next_token or not issues or len(out) >= max_issues:
-            break
+        if not next_token or not data.get("issues"): break
     return out
 
-def fetch_legacy(base: str, email: str, token: str, jql: str, fields: List[str],
-                 max_issues: int, batch_size: int, expand: str) -> List[Dict[str, Any]]:
+def fetch_legacy(base, email, token, jql, req_fields, max_issues, batch_size, expand):
     url = f"{base}/rest/api/3/search"
     headers, auth = jira_auth(email, token)
-    out: List[Dict[str, Any]] = []
-    start_at = 0
-    req_fields = compute_request_fields(fields)
-
+    out, start_at = [], 0
     while True:
         remaining = max_issues - len(out)
-        if remaining <= 0:
-            break
+        if remaining <= 0: break
         limit = min(batch_size, remaining)
-        payload: Dict[str, Any] = {
-            "jql": jql,
-            "startAt": start_at,
-            "maxResults": limit,
-            "fields": req_fields,
-        }
-        if expand:
-            payload["expand"] = [e.strip() for e in expand.split(",") if e.strip()]
-
+        payload = {"jql": jql, "startAt": start_at, "maxResults": limit, "fields": req_fields}
+        if expand: payload["expand"] = [e.strip() for e in expand.split(",") if e.strip()]
         resp = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload), timeout=60)
         if resp.status_code != 200:
             raise RuntimeError(f"Jira API error {resp.status_code}: {resp.text}")
         data = resp.json()
-        issues = data.get("issues", [])
-        out.extend(issues)
-        if not issues:
-            break
-        start_at += len(issues)
+        batch = data.get("issues", [])
+        out.extend(batch)
+        if not batch: break
+        start_at += len(batch)
     return out
 
-# ------------- Enrichment -------------
+# --------- Enrichment ---------
 
-def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[Dict[str, Any]], parent_rank_field: str) -> None:
+def bulk_fill_parent_summaries(base, email, token, issues, parent_rank_field):
     want_keys = set()
     for iss in issues:
-        fields = iss.get("fields") or {}
-        parent = fields.get("parent")
+        f = iss.get("fields") or {}
+        parent = f.get("parent")
         if isinstance(parent, dict):
             embedded = isinstance(parent.get("fields"), dict) and parent["fields"].get("summary")
-            if not embedded and parent.get("key"):
-                want_keys.add(parent["key"])
-    if not want_keys:
-        return
+            if not embedded and parent.get("key"): want_keys.add(parent["key"])
+    if not want_keys: return
 
-    jql = "key in (" + ",".join(sorted(want_keys)) + ")"
     url = f"{base}/rest/api/3/search"
     headers, auth = jira_auth(email, token)
-    payload = {"jql": jql, "fields": ["summary", parent_rank_field], "maxResults": len(want_keys)}
+    payload = {"jql": "key in (" + ",".join(sorted(want_keys)) + ")", "fields": ["summary", parent_rank_field], "maxResults": len(want_keys)}
     try:
-        resp = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload), timeout=60)
-        if resp.status_code != 200:
-            return
-        data = resp.json()
-        by_key: Dict[str, Dict[str, Any]] = {}
+        r = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload), timeout=60)
+        if r.status_code != 200: return
+        data = r.json()
+        by_key = {}
         for it in data.get("issues", []):
             k = it.get("key"); flds = it.get("fields") or {}
-            by_key[k] = {"summary": flds.get("summary", ""), "rank": flds.get(parent_rank_field)}
+            by_key[k] = {"summary": flds.get("summary",""), "rank": flds.get(parent_rank_field)}
         for iss in issues:
-            fields = iss.get("fields") or {}
-            parent = fields.get("parent")
+            parent = (iss.get("fields") or {}).get("parent")
             if isinstance(parent, dict) and parent.get("key"):
                 meta = by_key.get(parent["key"], {})
-                if isinstance(meta, dict):
-                    parent["_summary_cache"] = meta.get("summary", parent.get("_summary_cache", ""))
-                    parent["_rank_cache"] = meta.get("rank", parent.get("_rank_cache", None))
+                parent["_summary_cache"] = meta.get("summary", parent.get("_summary_cache",""))
+                parent["_rank_cache"] = meta.get("rank", parent.get("_rank_cache", None))
     except Exception:
         return
 
-# ------------- Rendering -------------
+# --------- Rendering ---------
 
-def extract_field(issue: Dict[str, Any], field: str, tzname: str, datefmt: str) -> str:
+def extract_field(issue, field, tzname, datefmt):
     f = field.lower()
-    if f == "key":
-        return issue.get("key", "")
-    fields = issue.get("fields", {})
-
-    if f == "summary":
-        return fields.get("summary", "") or ""
+    if f == "key": return issue.get("key","")
+    fields = issue.get("fields") or {}
+    if f == "summary": return fields.get("summary","") or ""
     if f == "status":
         st = fields.get("status") or {}
-        return (st.get("name") or st.get("statusCategory", {}).get("name") or "") or ""
+        return (st.get("name") or st.get("statusCategory",{}).get("name") or "") or ""
     if f == "assignee":
         asg = fields.get("assignee") or {}
         return asg.get("displayName") or asg.get("name") or ""
-    if f in {"updated", "created", "duedate", "resolutiondate"}:
-        return format_date(fields.get(field) or fields.get(f), tzname, datefmt)
-
-    if f in {"parentsummary", "parent_summary"}:
+    if f in {"updated","created","duedate","resolutiondate"}:
+        v = fields.get(field) or fields.get(f); return format_date(v, tzname, datefmt)
+    if f in {"parentsummary","parent_summary"}:
         parent = fields.get("parent") or {}
         if isinstance(parent, dict):
             if isinstance(parent.get("fields"), dict) and parent["fields"].get("summary"):
                 return parent["fields"]["summary"]
-            return parent.get("_summary_cache", "")
+            return parent.get("_summary_cache","")
         return ""
-
     val = fields.get(field) or fields.get(f)
     if isinstance(val, dict):
-        for k in ("displayName", "name", "value", "id"):
-            if k in val and isinstance(val[k], (str, int)):
-                return str(val[k])
+        for k in ("displayName","name","value","id"):
+            if k in val and isinstance(val[k], (str,int)): return str(val[k])
         return json.dumps(val, ensure_ascii=False)
     if isinstance(val, list):
         simple = []
@@ -254,84 +227,74 @@ def extract_field(issue: Dict[str, Any], field: str, tzname: str, datefmt: str) 
         return ", ".join([s for s in simple if s])
     return "" if val is None else str(val)
 
-def group_issues_by_parent(issues: List[Dict[str, Any]], issue_rank_field: str, parent_rank_field: str) -> Dict[str, Dict[str, Any]]:
+def group_issues_by_parent(issues, issue_rank_field, parent_rank_field):
     groups: Dict[str, Dict[str, Any]] = {}
     for iss in issues:
         f = iss.get("fields") or {}
         parent = f.get("parent")
         if isinstance(parent, dict):
             pkey = parent.get("key") or "NO_PARENT"
-            # title
-            if isinstance(parent.get("fields"), dict) and parent["fields"].get("summary"):
-                ptitle = parent["fields"]["summary"]
-            else:
-                ptitle = parent.get("_summary_cache", "")
-            # rank (embedded field or cached)
             pf = parent.get("fields") or {}
-            prank = pf.get(parent_rank_field) or parent.get("_rank_cache", "")
+            ptitle = (pf.get("summary") or parent.get("_summary_cache","") or "")
+            prank = pf.get(parent_rank_field) or parent.get("_rank_cache","") or ""
         else:
             pkey = "NO_PARENT"; ptitle = ""; prank = ""
         if pkey not in groups:
-            groups[pkey] = {"title": ptitle, "rank": prank or "", "issues": []}
+            groups[pkey] = {"title": ptitle, "rank": prank, "issues": []}
         if ptitle and not groups[pkey]["title"]:
             groups[pkey]["title"] = ptitle
         if prank and not groups[pkey].get("rank"):
             groups[pkey]["rank"] = prank
-        # child rank capture
-        child_rank = (f.get(issue_rank_field) or "")
-        iss["_child_rank_cache"] = child_rank
+        iss["_child_rank_cache"] = (f.get(issue_rank_field) or "")
         groups[pkey]["issues"].append(iss)
+    # Pre-compute min child rank for fallback ordering
+    for k, meta in groups.items():
+        child_ranks = [i.get("_child_rank_cache") for i in meta["issues"] if i.get("_child_rank_cache")]
+        meta["_min_child_rank"] = min(child_ranks) if child_ranks else ""
     return groups
 
-def build_markdown_table(issues: List[Dict[str, Any]], fields: List[str], tzname: str, datefmt: str) -> str:
-    if not issues:
-        return "_No issues found for the given JQL._"
+def build_markdown_table(issues, fields, tzname, datefmt):
+    if not issues: return "_No issues found for the given JQL._"
     header = " | ".join(fields)
     sep = " | ".join(["---"] * len(fields))
     rows = [header, sep]
     for issue in issues:
-        vals = [extract_field(issue, f, tzname, datefmt).replace("\n", " ").strip() for f in fields]
-        vals = [v.replace("|", "\\|") for v in vals]
+        vals = [extract_field(issue, f, tzname, datefmt).replace("\n"," ").strip() for f in fields]
+        vals = [v.replace("|","\\|") for v in vals]
         rows.append(" | ".join(vals))
     return "\n".join(rows)
 
-def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzname: str, datefmt: str,
-                           strip_parent_summary: bool = True, issue_rank_field: str = "customfield_10015",
-                           parent_rank_field: str = "customfield_10015", debug=False) -> str:
-    if not issues:
-        return "_No issues found for the given JQL._"
+def build_grouped_markdown(issues, fields, tzname, datefmt, strip_parent_summary, issue_rank_field, parent_rank_field, debug=False):
+    if not issues: return "_No issues found for the given JQL._"
     groups = group_issues_by_parent(issues, issue_rank_field, parent_rank_field)
-    fields_local = list(fields)
-    if strip_parent_summary:
-        fields_local = [f for f in fields_local if f.lower() not in {"parentsummary","parent_summary"}]
+    fields_local = [f for f in fields if not(strip_parent_summary and f.lower() in {"parentsummary","parent_summary"})]
 
     def sort_group_key(k: str):
-        if k == "NO_PARENT":
-            return (1, "", k)
-        rank = groups[k].get("rank", "")
-        return (0, rank or "~", k)
+        if k == "NO_PARENT": return (1, "", "", k)
+        prank = groups[k].get("rank","")
+        min_child = groups[k].get("_min_child_rank","")
+        # Prefer parent rank, otherwise min child rank; fallback key
+        basis = prank or min_child or "~"
+        return (0, basis, k)
 
-    ordered_keys = sorted(groups.keys(), key=sort_group_key)
+    ordered = sorted(groups.keys(), key=sort_group_key)
 
     if debug:
+        print(f"Using parent_rank_field={parent_rank_field} issue_rank_field={issue_rank_field}")
         print("Parent group order:")
-        for k in ordered_keys:
+        for k in ordered:
             meta = groups[k]
-            print(f"  {k}: rank={meta.get('rank','')} title={meta.get('title','')} size={len(meta['issues'])}")
-        # Show a couple of child ranks for the first group
-        if ordered_keys:
-            first = ordered_keys[0]
+            print(f"  {k}: prank={meta.get('rank','')} min_child={meta.get('_min_child_rank','')} title={meta.get('title','')} size={len(meta['issues'])}")
+        if ordered:
+            first = ordered[0]
             sample = [i.get('_child_rank_cache') for i in groups[first]['issues'][:5]]
             print(f"Sample child ranks for {first}: {sample}")
 
     sections = []
-    for pkey in ordered_keys:
+    for pkey in ordered:
         meta = groups[pkey]
         title = meta.get("title") or ""
-        if pkey == "NO_PARENT":
-            heading = "**No Parent**"
-        else:
-            heading = f"**{pkey} — {title}**" if title else f"**{pkey}**"
+        heading = "**No Parent**" if pkey == "NO_PARENT" else f"**{pkey} — {title}**" if title else f"**{pkey}**"
         sections.append(heading)
 
         children = list(meta["issues"])
@@ -341,32 +304,29 @@ def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzna
         sep = " | ".join(["---"] * len(fields_local))
         rows = [header, sep]
         for issue in children:
-            vals = [extract_field(issue, f, tzname, datefmt).replace("\n", " ").strip() for f in fields_local]
-            vals = [v.replace("|", "\\|") for v in vals]
+            vals = [extract_field(issue, f, tzname, datefmt).replace("\n"," ").strip() for f in fields_local]
+            vals = [v.replace("|","\\|") for v in vals]
             rows.append(" | ".join(vals))
         sections.append("\n".join(rows))
-    return "\n\n".join(sections)
+    return "\n".join(sections)
 
-def chunk_text(text: str, max_len: int = 20000) -> List[str]:
-    if len(text) <= max_len:
-        return [text]
-    chunks, current, n = [], [], 0
+def chunk_text(text: str, max_len: int = 20000):
+    if len(text) <= max_len: return [text]
+    chunks, cur, n = [], [], 0
     for line in text.splitlines(False):
         if n + len(line) + 1 > max_len:
-            chunks.append("\n".join(current)); current, n = [line], len(line) + 1
+            chunks.append("\n".join(cur)); cur, n = [line], len(line) + 1
         else:
-            current.append(line); n += len(line) + 1
-    if current: chunks.append("\n".join(current))
+            cur.append(line); n += len(line) + 1
+    if cur: chunks.append("\n".join(cur))
     return chunks
 
-def post_to_teams(webhook_url: str, title: str, markdown_text: str) -> None:
+def post_to_teams(webhook_url: str, title: str, markdown_text: str):
     payload = {"@type": "MessageCard", "@context": "http://schema.org/extensions",
                "summary": title, "themeColor": "0076D7", "title": title, "text": markdown_text}
     resp = requests.post(webhook_url, json=payload, timeout=45)
     if not (200 <= resp.status_code < 300):
         raise RuntimeError(f"Teams webhook error {resp.status_code}: {resp.text}")
-
-# ---------------- Main ----------------
 
 def main():
     base = env_or_config("JIRA_BASE_URL")
@@ -386,34 +346,49 @@ def main():
     reconcile_ids = parse_reconcile_ids(env_or_config("RECONCILE_ISSUE_IDS") or "")
     group_by_parent = parse_bool(env_or_config("GROUP_BY_PARENT") or "true", default=True)
     strip_parent_summary = parse_bool(env_or_config("GROUP_STRIP_PARENT_SUMMARY") or "true", default=True)
-    parent_rank_field = env_or_config("PARENT_RANK_FIELD") or "customfield_10015"
-    issue_rank_field = env_or_config("ISSUE_RANK_FIELD") or "customfield_10015"
+    parent_rank_field = env_or_config("PARENT_RANK_FIELD") or ""
+    issue_rank_field = env_or_config("ISSUE_RANK_FIELD") or ""
     sort_children = parse_bool(env_or_config("SORT_CHILDREN_BY_RANK") or "true", default=True)
     debug = parse_bool(env_or_config("DEBUG_ORDER") or "false", default=False)
+    auto_detect = parse_bool(env_or_config("AUTO_DETECT_RANK") or "true", default=True)
 
     missing = [n for n, v in [("JIRA_BASE_URL", base), ("JIRA_EMAIL", email), ("JIRA_API_TOKEN", token),
                                ("JIRA_JQL", jql), ("TEAMS_WEBHOOK_URL", webhook)] if not v]
     if missing:
-        print("Missing required configuration values:", ", ".join(missing), file=sys.stderr)
-        sys.exit(2)
+        print("Missing required configuration values:", ", ".join(missing), file=sys.stderr); sys.exit(2)
+
+    # Auto-detect Rank field if not provided
+    if auto_detect and (not parent_rank_field or not issue_rank_field):
+        fid = detect_rank_field(base, email, token)
+        if fid:
+            if not parent_rank_field: parent_rank_field = fid
+            if not issue_rank_field: issue_rank_field = fid
+            if debug: print(f"Auto-detected Rank field id: {fid}")
+        else:
+            if debug: print("Warning: could not auto-detect Rank field id.")
+
+    req_fields = compute_request_fields(fields, issue_rank_field if sort_children else "", group_by_parent)
 
     print(f"Querying Jira with JQL: {jql}")
     if use_legacy:
-        issues = fetch_legacy(base, email, token, jql, fields, max_issues, batch_size, expand)
+        issues = fetch_legacy(base, email, token, jql, req_fields, max_issues, batch_size, expand)
     else:
-        issues = fetch_enhanced(base, email, token, jql, fields, max_issues, batch_size, expand, reconcile_ids)
+        issues = fetch_enhanced(base, email, token, jql, req_fields, max_issues, batch_size, expand, reconcile_ids)
 
     if any(f.lower() in {"parentsummary", "parent_summary"} for f in fields) or group_by_parent:
-        bulk_fill_parent_summaries(base, email, token, issues, parent_rank_field)
+        # Ensure we have a parent rank field to ask for; if not, detection failed — grouping will fall back to child min rank
+        if not parent_rank_field:
+            if debug: print("Note: parent rank field id empty; will use min child rank as fallback ordering.")
+        else:
+            bulk_fill_parent_summaries(base, email, token, issues, parent_rank_field)
 
     print(f"Fetched {len(issues)} issues")
-
     if group_by_parent:
         markdown = build_grouped_markdown(
             issues, fields, tzname, datefmt,
             strip_parent_summary=strip_parent_summary,
-            issue_rank_field=(issue_rank_field if sort_children else "no_sort"),
-            parent_rank_field=parent_rank_field,
+            issue_rank_field=(issue_rank_field if sort_children else ""),
+            parent_rank_field=(parent_rank_field or ""),
             debug=debug
         )
     else:
