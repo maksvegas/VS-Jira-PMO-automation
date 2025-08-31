@@ -1,19 +1,17 @@
 #!/usr/bin/env python3
 """
-jira_to_teams_report.py — grouped Jira → Teams report (priority-aware + robust enrichment)
+jira_to_teams_report.py — Jira → Teams grouped report with table rendering
+v2.8 — single-message batching
 
-Ordering precedence:
-  1) Explicit override (PARENT_ORDER)
-  2) Parent numeric priority (PARENT_PRIORITY_FIELD; asc/desc)
-  3) Parent Rank / Epic Rank (direction controlled)
-  4) Min child Rank (fallback)
-  5) Key
+TEAMS_MESSAGE_MODE:
+  - "plain"    → MessageCard with monospace ASCII tables (combined into one message when possible)
+  - "adaptive" → Adaptive Card grid (multiple sections in one card; auto-splits if too large)
 
-Supports deriving parent priority from children via PARENT_PRIORITY_AGG=min|avg|max.
+TEAMS_SINGLE_MESSAGE: "true" (default) — try to send everything in one message/card when feasible.
 """
 
 import os, sys, json
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import requests
 
@@ -22,11 +20,11 @@ try:
 except Exception:
     ZoneInfo = None
 
-VERSION = "jira_to_teams_report.py v2.6"
+VERSION = "jira_to_teams_report.py v2.8"
 
 # ---------------- Helpers ----------------
 
-def env_or_config(name: str, default=None):
+def env(name: str, default=None):
     return os.getenv(name, default)
 
 def parse_bool(v: Optional[str], default=False) -> bool:
@@ -155,10 +153,9 @@ def fetch_legacy(base: str, email: str, token: str, jql: str, req_fields: List[s
         start_at += len(batch)
     return out
 
-# ------------- Fallback fetch -------------
+# ------------- Parent enrichment -------------
 
 def fetch_parent_fields_individually(base: str, email: str, token: str, keys: list, fields: list, debug: bool=False) -> dict:
-    """Fetch parent fields one-by-one via GET /issue/{key}?fields=... (robust fallback)."""
     headers, auth = jira_auth(email, token)
     out = {}
     for k in sorted(keys):
@@ -174,14 +171,9 @@ def fetch_parent_fields_individually(base: str, email: str, token: str, keys: li
             if debug: print(f"Fallback GET /issue/{k} exception: {e}")
     return out
 
-# ------------- Enrichment -------------
-
 def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[Dict[str, Any]],
                                parent_rank_field: str, epic_rank_field: str, parent_priority_field: str = "",
                                debug: bool = False, force_get: bool = False) -> None:
-    """Fetch summary + rank(s) + numeric priority for **all** parents referenced by the issues.
-       Uses enhanced /search/jql in bulk, and falls back to per-parent GET where needed.
-    """
     want_keys = set()
     for iss in issues:
         fields = iss.get("fields") or {}
@@ -193,23 +185,13 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
 
     headers, auth = jira_auth(email, token)
 
-    # FORCE per-parent GET path
     if force_get:
         print(f"Parent enrichment: FORCE GET for {len(want_keys)} parents")
-        if debug:
-            print("Parent enrichment (force): fields requested -> summary"
-                  f"{', '+parent_priority_field if parent_priority_field else ''}"
-                  f"{', '+parent_rank_field if parent_rank_field else ''}"
-                  f"{', '+epic_rank_field if epic_rank_field else ''}")
         want_fields = ["summary"]
         if parent_priority_field: want_fields.append(parent_priority_field)
         if parent_rank_field:     want_fields.append(parent_rank_field)
         if epic_rank_field:       want_fields.append(epic_rank_field)
         per = fetch_parent_fields_individually(base, email, token, want_keys, want_fields, debug=debug)
-        if debug and per:
-            print("Parent enrichment sample (first 10 from GET /issue):")
-            for i,(k,v) in enumerate(list(per.items())[:10]):
-                print(f"  {k}: priority_raw={v.get(parent_priority_field)} rank={v.get(parent_rank_field,'')} epic_rank={v.get(epic_rank_field,'')}")
         for iss in issues:
             p = (iss.get("fields") or {}).get("parent")
             if isinstance(p, dict) and p.get("key"):
@@ -220,7 +202,6 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
                 if epic_rank_field:       p["_epic_rank_cache"] = pf.get(epic_rank_field, p.get("_epic_rank_cache", None))
         return
 
-    # Bulk enhanced search (/search/jql)
     url = f"{base}/rest/api/3/search/jql"
     fetch_fields = ["summary"]
     if parent_rank_field: fetch_fields.append(parent_rank_field)
@@ -235,11 +216,7 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
     by_key: Dict[str, Dict[str, Any]] = {}
     try:
         r = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload), timeout=60)
-        if r.status_code != 200:
-            if debug:
-                print(f"Bulk parent /search failed: {r.status_code} {r.text[:200]}")
-            # continue; we'll do full GET fallback below
-        else:
+        if r.status_code == 200:
             data = r.json()
             for it in data.get("issues", []):
                 k = it.get("key"); flds = it.get("fields") or {}
@@ -248,13 +225,10 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
                 if epic_rank_field:       meta["epic_rank"] = flds.get(epic_rank_field)
                 if parent_priority_field: meta["priority_num"] = flds.get(parent_priority_field)
                 by_key[k] = meta
+        else:
+            if debug:
+                print(f"Bulk parent /search failed: {r.status_code} {r.text[:200]}")
 
-            if debug and by_key:
-                print("Parent enrichment sample (first 10 from bulk /search):")
-                for i,(k,v) in enumerate(list(by_key.items())[:10]):
-                    print(f"  {k}: priority_raw={v.get('priority_num')} rank={v.get('rank','')} epic_rank={v.get('epic_rank','')} summary={v.get('summary','')}")
-
-        # Apply whatever we got from bulk
         for iss in issues:
             p = (iss.get("fields") or {}).get("parent")
             if isinstance(p, dict) and p.get("key"):
@@ -264,7 +238,6 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
                 if "epic_rank" in meta:   p["_epic_rank_cache"]  = meta.get("epic_rank", p.get("_epic_rank_cache", None))
                 if "priority_num" in meta:p["_priority_num_cache"]= meta.get("priority_num", p.get("_priority_num_cache", None))
 
-        # Identify parents still missing values → GET fallback
         missing = set()
         for iss in issues:
             p = (iss.get("fields") or {}).get("parent")
@@ -283,10 +256,6 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
             if debug:
                 print(f"Parent enrichment fallback: GET /issue for {len(missing)} parents: {sorted(list(missing))[:10]}{'...' if len(missing)>10 else ''}")
             per = fetch_parent_fields_individually(base, email, token, missing, want_fields, debug=debug)
-            if debug and per:
-                print("Parent enrichment sample (first 10 from GET /issue):")
-                for i,(k,v) in enumerate(list(per.items())[:10]):
-                    print(f"  {k}: priority_raw={v.get(parent_priority_field)} rank={v.get(parent_rank_field,'')} epic_rank={v.get(epic_rank_field,'')}")
             for iss in issues:
                 p = (iss.get("fields") or {}).get("parent")
                 if isinstance(p, dict) and p.get("key") and p["key"] in per:
@@ -299,20 +268,7 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
     except Exception as e:
         if debug:
             print(f"bulk_fill_parent_summaries exception: {e}")
-        # last-resort: fetch *all* via GET
-        want_fields = ["summary"]
-        if parent_priority_field: want_fields.append(parent_priority_field)
-        if parent_rank_field:     want_fields.append(parent_rank_field)
-        if epic_rank_field:       want_fields.append(epic_rank_field)
-        per = fetch_parent_fields_individually(base, email, token, want_keys, want_fields, debug=debug)
-        for iss in issues:
-            p = (iss.get("fields") or {}).get("parent")
-            if isinstance(p, dict) and p.get("key") and p["key"] in per:
-                pf = per[p["key"]]
-                p["_summary_cache"] = pf.get("summary", p.get("_summary_cache",""))
-                if parent_priority_field: p["_priority_num_cache"] = pf.get(parent_priority_field, p.get("_priority_num_cache", None))
-                if parent_rank_field:     p["_rank_cache"] = pf.get(parent_rank_field, p.get("_rank_cache", None))
-                if epic_rank_field:       p["_epic_rank_cache"] = pf.get(epic_rank_field, p.get("_epic_rank_cache", None))
+        # Last resort: skip enrichment
 
 # ------------- Rendering -------------
 
@@ -415,33 +371,22 @@ def group_issues_by_parent(issues: List[Dict[str, Any]], issue_rank_field: str,
         meta["_min_child_rank"] = min(cr) if cr else ""
     return groups
 
-def build_markdown_table(issues: List[Dict[str, Any]], fields: List[str], tzname: str, datefmt: str) -> str:
-    if not issues:
-        return "_No issues found for the given JQL._"
-    header = " | ".join(fields)
-    sep = " | ".join(["---"] * len(fields))
-    rows = [header, sep]
-    for issue in issues:
-        vals = [extract_field(issue, f, tzname, datefmt).replace("\n", " ").strip() for f in fields]
-        vals = [v.replace("|", "\\|") for v in vals]
-        rows.append(" | ".join(vals))
-    return "\n".join(rows)
+def build_rows_flat(issues: List[Dict[str, Any]], fields: List[str], tzname: str, datefmt: str) -> Tuple[List[str], List[List[str]]]:
+    cols = list(fields)
+    rows = [[extract_field(issue, f, tzname, datefmt) for f in cols] for issue in issues]
+    return cols, rows
 
-def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzname: str, datefmt: str,
-                           strip_parent_summary: bool, issue_rank_field: str,
-                           parent_rank_field: str, epic_rank_field: str, use_epic_rank: bool,
-                           parent_dir: str = "desc", child_dir: str = "asc",
-                           parent_order: str = "", parent_order_mode: str = "auto",
-                           parent_priority_field: str = "", child_priority_field: str = "",
-                           parent_priority_dir: str = "asc", child_priority_dir: str = "asc",
-                           parent_priority_agg: str = "",
-                           debug=False, debug_parent=False) -> str:
-    if not issues:
-        return "_No issues found for the given JQL._"
+def build_rows_grouped(issues: List[Dict[str, Any]], fields: List[str], tzname: str, datefmt: str,
+                       strip_parent_summary: bool, issue_rank_field: str,
+                       parent_rank_field: str, epic_rank_field: str, use_epic_rank: bool,
+                       parent_dir: str, child_dir: str,
+                       parent_order: str, parent_order_mode: str,
+                       parent_priority_field: str, child_priority_field: str,
+                       parent_priority_dir: str, child_priority_dir: str,
+                       parent_priority_agg: str, debug=False) -> List[Tuple[str, List[str], List[List[str]]]]:
     groups = group_issues_by_parent(issues, issue_rank_field, parent_rank_field, epic_rank_field, use_epic_rank,
                                     parent_priority_field=parent_priority_field, child_priority_field=child_priority_field)
 
-    # Optionally derive parent priority from children if missing
     if parent_priority_agg in {"min", "avg", "max"}:
         for k, meta in groups.items():
             if meta.get("priority") is None:
@@ -453,10 +398,7 @@ def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzna
                         meta["priority"] = max(vals)
                     else:
                         meta["priority"] = sum(vals)/len(vals)
-        if debug_parent:
-            print(f"Applied PARENT_PRIORITY_AGG={parent_priority_agg} for parents lacking numeric priority.")
 
-    # explicit order map
     order_map = {}
     if parent_order:
         raw_items = [x.strip() for x in parent_order.split(",") if x.strip()]
@@ -477,45 +419,26 @@ def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzna
         return None
 
     def sort_group_key(k: str):
-        if k == "NO_PARENT": return (9999, 0, "", k)  # always last unless explicitly listed
+        if k == "NO_PARENT": return (9999, 0, "", k)
         idx = explicit_index(k)
         if idx is not None:
             return (0, idx, "", k)
-        # numeric priority
         pprio = groups[k].get("priority")
         if pprio is not None:
             adj = pprio if parent_priority_dir == "asc" else -pprio
             return (1, adj, "", k)
-        # parent rank or min child rank
         prank = groups[k].get("rank","") or groups[k].get("_min_child_rank","") or "~"
         if parent_dir == "desc":
-            # invert rank by sorting on a tuple that will place lexicographically larger earlier
-            return (2, "", "".join(chr(255 - ord(c)) for c in prank), k)  # cheap invert
+            return (2, "", "".join(chr(255 - ord(c)) for c in prank), k)
         return (2, "", prank, k)
 
     ordered = sorted(groups.keys(), key=sort_group_key)
-
-    if debug:
-        print(f"Ordering with parent_rank_field={parent_rank_field or '(none)'} epic_rank_field={epic_rank_field or '(none)'} use_epic_rank={use_epic_rank} parent_dir={parent_dir} child_dir={child_dir} parent_priority_field={parent_priority_field or '(none)'} child_priority_field={child_priority_field or '(none)'}")
-        if order_map:
-            print("Explicit order map detected (lower index = higher priority):")
-            print("  " + ", ".join([f"{k}:{v}" for k,v in list(order_map.items())[:30]]))
-        print("Parent group order:")
-        for k in ordered:
-            meta = groups[k]
-            print(f"  {k}: priority={meta.get('priority', '')} prank={meta.get('rank','')} source={meta.get('rank_source','')} min_child={meta.get('_min_child_rank','')} title={meta.get('title','')} size={len(meta['issues'])}")
-        if ordered:
-            first = ordered[0]
-            sample = [i.get('_child_rank_cache') for i in groups[first]['issues'][:5]]
-            print(f"Sample child ranks for {first}: {sample}")
 
     sections = []
     for pkey in ordered:
         meta = groups[pkey]
         title = meta.get("title") or ""
-        heading = "**No Parent**" if pkey == "NO_PARENT" else f"**{pkey} — {title}**" if title else f"**{pkey}**"
-        sections.append(heading)
-
+        heading = "No Parent" if pkey == "NO_PARENT" else (f"{pkey} — {title}" if title else pkey)
         children = list(meta["issues"])
 
         def child_key(it):
@@ -523,96 +446,130 @@ def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzna
             if cprio is not None:
                 adj = cprio if child_priority_dir == "asc" else -cprio
                 return (0, adj, it.get("key") or "")
-            # rank fallback
             rk = it.get("_child_rank_cache") or "~"
             if child_dir == "desc":
                 rk = "".join(chr(255 - ord(c)) for c in rk)
             return (1, rk, it.get("key") or "")
 
         children.sort(key=child_key)
+        cols = list(fields_local)
+        rows = [[extract_field(issue, f, tzname, datefmt) for f in cols] for issue in children]
+        sections.append((heading, cols, rows))
+    return sections
 
-        header = " | ".join(fields_local)
-        sep = " | ".join(["---"] * len(fields_local))
-        rows = [header, sep]
-        for issue in children:
-            vals = [extract_field(issue, f, tzname, datefmt).replace("\n", " ").strip() for f in fields_local]
-            vals = [v.replace("|", "\\|") for v in vals]
-            rows.append(" | ".join(vals))
-        sections.append("\n".join(rows))
-    return "\n".join(sections)
+# ---- ASCII table + Teams posting ----
 
-def chunk_text(text: str, max_len: int = 20000) -> List[str]:
-    if len(text) <= max_len: return [text]
-    chunks, cur, n = [], [], 0
-    for line in text.splitlines(False):
-        if n + len(line) + 1 > max_len:
-            chunks.append("\n".join(cur)); cur, n = [line], len(line) + 1
-        else:
-            cur.append(line); n += len(line) + 1
-    if cur: chunks.append("\n".join(cur))
-    return chunks
+def to_monospace_table(headers: List[str], rows: List[List[str]], max_col_width=60) -> str:
+    if not headers: return "```\n(no columns)\n```"
+    widths = []
+    for i, h in enumerate(headers):
+        longest = len(h)
+        for r in rows:
+            if i < len(r):
+                v = "" if r[i] is None else str(r[i]).replace("\n", " ")
+                if len(v) > longest: longest = len(v)
+        widths.append(min(longest, max_col_width))
+    def cut(s, w):
+        s = "" if s is None else str(s).replace("\n", " ")
+        return s[:w]
+    def fmt_row(cells):
+        return " | ".join(cut(c, w).ljust(w) for c, w in zip(cells, widths))
+    lines = []
+    lines.append(fmt_row(headers))
+    lines.append("-+-".join("-" * w for w in widths))
+    for r in rows:
+        lines.append(fmt_row([r[i] if i < len(r) else "" for i in range(len(headers))]))
+    return "```\n" + "\n".join(lines) + "\n```"
 
-def post_to_teams(webhook_url: str, title: str, markdown_text: str) -> None:
+def post_to_teams_messagecard(webhook_url: str, title: str, text_block: str) -> None:
     payload = {"@type":"MessageCard","@context":"http://schema.org/extensions",
-               "summary":title,"themeColor":"0076D7","title":title,"text":markdown_text}
+               "summary":title,"themeColor":"0076D7","title":title,"text":text_block}
     resp = requests.post(webhook_url, json=payload, timeout=45)
-    # Accept any 2xx as success
+    if not (200 <= resp.status_code < 300):
+        raise RuntimeError(f"Teams webhook error {resp.status_code}: {resp.text}")
+
+def post_to_teams_adaptive_grid(webhook_url: str, title: str, sections: List[Tuple[str, List[str], List[List[str]]]]) -> None:
+    body = [{"type":"Container","items":[{"type":"TextBlock","text": title,"weight":"Bolder","size":"Medium"}]}]
+    for heading, cols, rows in sections:
+        body.append({"type":"Container","items":[{"type":"TextBlock","text": f"**{heading}**","wrap": True}]})
+        header_cols = [{"type":"TextBlock","text": f"**{c}**","wrap": True} for c in cols]
+        body.append({"type":"Container","items":[{"type":"ColumnSet","columns":[{"type":"Column","width":"stretch","items":[hc]} for hc in header_cols]}]})
+        for r in rows:
+            cells = [{"type":"TextBlock","text": ("" if c is None else str(c)), "wrap": True} for c in r]
+            body.append({"type":"Container","items":[{"type":"ColumnSet","columns":[{"type":"Column","width":"stretch","items":[cell]} for cell in cells]}]})
+
+    payload = {
+        "type": "message",
+        "attachments": [{
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "contentUrl": None,
+            "content": {
+                "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                "type": "AdaptiveCard",
+                "version": "1.4",
+                "body": body
+            }
+        }]
+    }
+    resp = requests.post(webhook_url, json=payload, timeout=45)
     if not (200 <= resp.status_code < 300):
         raise RuntimeError(f"Teams webhook error {resp.status_code}: {resp.text}")
 
 # ---------------- Main ----------------
 
 def main():
-    base = env_or_config("JIRA_BASE_URL")
-    email = env_or_config("JIRA_EMAIL")
-    token = env_or_config("JIRA_API_TOKEN")
-    jql = env_or_config("JIRA_JQL")
-    fields_csv = os.getenv("JIRA_FIELDS")
-    fields = [s.strip() for s in fields_csv.split(",")] if fields_csv else ["key", "summary", "parentSummary", "status", "assignee", "updated"]
-    webhook = env_or_config("TEAMS_WEBHOOK_URL")
-    title = env_or_config("TITLE") or "Jira Report"
-    datefmt = env_or_config("DATE_FORMAT") or "%Y-%m-%d %H:%M"
-    tzname = env_or_config("TIMEZONE") or "UTC"
-    max_issues = int(env_or_config("MAX_ISSUES") or 500)
-    batch_size = int(env_or_config("BATCH_SIZE") or 100)
-    use_legacy = parse_bool(env_or_config("JIRA_USE_LEGACY"), default=False)
-    expand = env_or_config("EXPAND") or ""
-    reconcile_ids = parse_reconcile_ids(env_or_config("RECONCILE_ISSUE_IDS") or "")
-    group_by_parent = parse_bool(env_or_config("GROUP_BY_PARENT") or "true", default=True)
-    strip_parent_summary = parse_bool(env_or_config("GROUP_STRIP_PARENT_SUMMARY") or "true", default=True)
+    base = env("JIRA_BASE_URL")
+    email = env("JIRA_EMAIL")
+    token = env("JIRA_API_TOKEN")
+    jql = env("JIRA_JQL")
+    fields_csv = env("JIRA_FIELDS")
+    fields = [s.strip() for s in fields_csv.split(",")] if fields_csv else ["key","summary","parentSummary","status","assignee","updated"]
+    webhook = env("TEAMS_WEBHOOK_URL")
+    title = env("TITLE", "Jira Report")
+    datefmt = env("DATE_FORMAT", "%Y-%m-%d %H:%M")
+    tzname = env("TIMEZONE", "UTC")
+    max_issues = int(env("MAX_ISSUES", "500"))
+    batch_size = int(env("BATCH_SIZE", "100"))
+    use_legacy = parse_bool(env("JIRA_USE_LEGACY"), default=False)
+    expand = env("EXPAND", "")
+    reconcile_ids = parse_reconcile_ids(env("RECONCILE_ISSUE_IDS", ""))
+    group_by_parent = parse_bool(env("GROUP_BY_PARENT", "true"), default=True)
+    strip_parent_summary = parse_bool(env("GROUP_STRIP_PARENT_SUMMARY", "true"), default=True)
 
-    parent_rank_field = env_or_config("PARENT_RANK_FIELD") or ""
-    epic_rank_field = env_or_config("PARENT_EPIC_RANK_FIELD") or ""
-    issue_rank_field = env_or_config("ISSUE_RANK_FIELD") or ""
-    auto_detect = parse_bool(env_or_config("AUTO_DETECT_RANK") or "true", default=True)
-    auto_detect_epic = parse_bool(env_or_config("AUTO_DETECT_EPIC_RANK") or "true", default=True)
-    use_epic_rank = parse_bool(env_or_config("USE_EPIC_RANK_FOR_EPICS") or "true", default=True)
+    parent_rank_field = env("PARENT_RANK_FIELD", "")
+    epic_rank_field = env("PARENT_EPIC_RANK_FIELD", "")
+    issue_rank_field = env("ISSUE_RANK_FIELD", "")
+    auto_detect = parse_bool(env("AUTO_DETECT_RANK", "true"), default=True)
+    auto_detect_epic = parse_bool(env("AUTO_DETECT_EPIC_RANK", "true"), default=True)
+    use_epic_rank = parse_bool(env("USE_EPIC_RANK_FOR_EPICS", "true"), default=True)
 
-    parent_dir = (env_or_config("PARENT_RANK_DIRECTION") or "desc").strip().lower()
-    child_dir = (env_or_config("CHILD_RANK_DIRECTION") or "asc").strip().lower()
+    parent_dir = env("PARENT_RANK_DIRECTION", "desc").strip().lower()
+    child_dir = env("CHILD_RANK_DIRECTION", "asc").strip().lower()
 
-    # Numeric priority fields
-    parent_priority_field = env_or_config("PARENT_PRIORITY_FIELD") or ""
-    parent_priority_dir = (env_or_config("PARENT_PRIORITY_DIRECTION") or "asc").strip().lower()
-    child_priority_field = env_or_config("CHILD_PRIORITY_FIELD") or ""
-    child_priority_dir = (env_or_config("CHILD_PRIORITY_DIRECTION") or "asc").strip().lower()
-    parent_priority_agg = (env_or_config("PARENT_PRIORITY_AGG") or "").strip().lower()
+    parent_priority_field = env("PARENT_PRIORITY_FIELD", "")
+    parent_priority_dir = env("PARENT_PRIORITY_DIRECTION", "asc").strip().lower()
+    child_priority_field = env("CHILD_PRIORITY_FIELD", "")
+    child_priority_dir = env("CHILD_PRIORITY_DIRECTION", "asc").strip().lower()
+    parent_priority_agg = env("PARENT_PRIORITY_AGG", "").strip().lower()
 
-    # Explicit override
-    parent_order = env_or_config("PARENT_ORDER") or ""
-    parent_order_mode = (env_or_config("PARENT_ORDER_MODE") or "auto").strip().lower()
+    parent_order = env("PARENT_ORDER", "")
+    parent_order_mode = env("PARENT_ORDER_MODE", "auto").strip().lower()
 
-    sort_children = parse_bool(env_or_config("SORT_CHILDREN_BY_RANK") or "true", default=True)
-    debug = parse_bool(env_or_config("DEBUG_ORDER") or "false", default=False)
-    debug_parent = parse_bool(env_or_config("DEBUG_PARENT_PRIORITY") or "false", default=False)
-    force_parent_get = parse_bool(env_or_config("PARENT_ENRICH_FORCE_GET") or "false", default=False)
+    sort_children = parse_bool(env("SORT_CHILDREN_BY_RANK", "true"), default=True)
+    debug = parse_bool(env("DEBUG_ORDER", "false"), default=False)
+    debug_parent = parse_bool(env("DEBUG_PARENT_PRIORITY", "false"), default=False)
+    force_parent_get = parse_bool(env("PARENT_ENRICH_FORCE_GET", "false"), default=False)
+
+    teams_mode = env("TEAMS_MESSAGE_MODE", "plain").strip().lower()
+    chunk_limit = int(env("TEAMS_CHUNK_LIMIT", "20000"))
+    single_msg = parse_bool(env("TEAMS_SINGLE_MESSAGE", "true"), default=True)
+    rows_per_card = int(env("TEAMS_ADAPTIVE_ROWS_PER_CARD", "60"))
 
     missing = [n for n, v in [("JIRA_BASE_URL", base), ("JIRA_EMAIL", email), ("JIRA_API_TOKEN", token),
                                ("JIRA_JQL", jql), ("TEAMS_WEBHOOK_URL", webhook)] if not v]
     if missing:
         print("Missing required configuration values:", ", ".join(missing), file=sys.stderr); sys.exit(2)
 
-    # Field auto-detect (Rank/Epic Rank) if not provided
     if auto_detect or auto_detect_epic:
         discovered = detect_fields(base, email, token, debug=debug)
         if auto_detect and not parent_rank_field and discovered.get("rank"):
@@ -631,9 +588,7 @@ def main():
     else:
         issues = fetch_enhanced(base, email, token, jql, req_fields, max_issues, batch_size, expand, reconcile_ids)
 
-    # Enrich ALL parents (summary + rank + epic rank + numeric priority), with fallback GET
     if any(f.lower() in {"parentsummary", "parent_summary"} for f in fields) or group_by_parent:
-        # DIAGNOSTIC: show what the script sees
         parent_keys = sorted({
             (iss.get("fields") or {}).get("parent", {}).get("key")
             for iss in issues
@@ -651,9 +606,9 @@ def main():
 
     print(f"Fetched {len(issues)} issues")
 
-    # Build markdown
+    # Build sections
     if group_by_parent:
-        markdown = build_grouped_markdown(
+        sections = build_rows_grouped(
             issues, fields, tzname, datefmt,
             strip_parent_summary=strip_parent_summary,
             issue_rank_field=(issue_rank_field if sort_children else ""),
@@ -669,18 +624,87 @@ def main():
             parent_priority_dir=parent_priority_dir,
             child_priority_dir=child_priority_dir,
             parent_priority_agg=parent_priority_agg,
-            debug=debug,
-            debug_parent=debug_parent
+            debug=debug
         )
     else:
-        markdown = build_markdown_table(issues, fields, tzname, datefmt)
+        cols, rows = build_rows_flat(issues, fields, tzname, datefmt)
+        sections = [("All Issues", cols, rows)]
 
-    # Chunk + post
-    chunks = chunk_text(markdown, max_len=int(os.getenv("TEAMS_CHUNK_LIMIT", "20000")))
-    for i, chunk in enumerate(chunks, 1):
-        chunk_title = title if i == 1 and len(chunks) == 1 else f"{title} (part {i}/{len(chunks)})"
-        post_to_teams(webhook, chunk_title, chunk)
-        print(f"Posted chunk {i} to Teams")
+    # ---- Teams posting ----
+    if teams_mode == "adaptive":
+        if single_msg:
+            # Combine all sections into one card, but split by row cap
+            combined: List[Tuple[str, List[str], List[List[str]]]] = []
+            total_rows = 0
+            for sec in sections:
+                heading, cols, rows = sec
+                if total_rows + len(rows) > rows_per_card and combined:
+                    # flush current combined
+                    post_to_teams_adaptive_grid(webhook, title, combined)
+                    print(f"Posted adaptive combined card with {total_rows} rows")
+                    combined, total_rows = [], 0
+                combined.append(sec)
+                total_rows += len(rows)
+            if combined:
+                post_to_teams_adaptive_grid(webhook, title, combined)
+                print(f"Posted adaptive combined card with {total_rows} rows")
+        else:
+            # one card per section
+            for heading, cols, rows in sections:
+                # split big sections by row cap
+                for start in range(0, len(rows) or 1, rows_per_card):
+                    slice_rows = rows[start:start+rows_per_card]
+                    post_to_teams_adaptive_grid(webhook, f"{title} — {heading}", [(heading, cols, slice_rows)])
+                    print(f"Posted adaptive section '{heading}' rows {start+1}-{start+len(slice_rows)}")
+    else:
+        # plain (MessageCard) — combine all sections into a single text block if requested
+        if single_msg:
+            blocks = []
+            for heading, cols, rows in sections:
+                blocks.append(f"**{heading}**\n\n" + to_monospace_table(cols, rows))
+            full_text = "\n\n".join(blocks)
+            if len(full_text) <= chunk_limit:
+                post_to_teams_messagecard(webhook, title, full_text)
+                print("Posted single MessageCard with all sections")
+            else:
+                # chunk by character limit
+                lines = full_text.splitlines()
+                cur, size, part = [], 0, 1
+                for ln in lines:
+                    if size + len(ln) + 1 > chunk_limit:
+                        chunk = "\n".join(cur)
+                        post_to_teams_messagecard(webhook, f"{title} (part {part})", chunk)
+                        print(f"Posted MessageCard chunk {part}")
+                        cur, size, part = [ln], len(ln)+1, part+1
+                    else:
+                        cur.append(ln); size += len(ln)+1
+                if cur:
+                    chunk = "\n".join(cur)
+                    post_to_teams_messagecard(webhook, f"{title} (part {part})", chunk)
+                    print(f"Posted MessageCard chunk {part}")
+        else:
+            # one message per section
+            for heading, cols, rows in sections:
+                text_block = f"**{heading}**\n\n" + to_monospace_table(cols, rows)
+                if len(text_block) <= chunk_limit:
+                    post_to_teams_messagecard(webhook, title, text_block)
+                    print(f"Posted section: {heading}")
+                else:
+                    # split large section by lines
+                    lines = text_block.splitlines()
+                    cur, size, part = [], 0, 1
+                    for ln in lines:
+                        if size + len(ln) + 1 > chunk_limit:
+                            chunk = "\n".join(cur)
+                            post_to_teams_messagecard(webhook, f"{title} — {heading} (part {part})", chunk)
+                            print(f"Posted section chunk {part}: {heading}")
+                            cur, size, part = [ln], len(ln)+1, part+1
+                        else:
+                            cur.append(ln); size += len(ln)+1
+                    if cur:
+                        chunk = "\n".join(cur)
+                        post_to_teams_messagecard(webhook, f"{title} — {heading} (part {part})", chunk)
+                        print(f"Posted section chunk {part}: {heading}")
 
 if __name__ == "__main__":
     main()
