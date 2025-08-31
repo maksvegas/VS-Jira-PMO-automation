@@ -38,6 +38,7 @@ jobs:
           # Sort controls
           GROUP_BY_PARENT: "true"
           SORT_CHILDREN_BY_RANK: "true"
+          USE_EPIC_RANK_FOR_EPICS: "true"    # default
           GROUP_STRIP_PARENT_SUMMARY: "true"
           AUTO_DETECT_RANK: "true"   # default, but set explicitly for this test
           # Temporary: print ordering to logs
