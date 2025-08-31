@@ -41,6 +41,7 @@ jobs:
           USE_EPIC_RANK_FOR_EPICS: "true"    # default
           GROUP_STRIP_PARENT_SUMMARY: "true"
           AUTO_DETECT_RANK: "true"   # default, but set explicitly for this test
+          AUTO_DETECT_EPIC_RANK: "true"   # add this
           # Temporary: print ordering to logs
           DEBUG_ORDER: "true"
         run: python jira_to_teams_report.py
