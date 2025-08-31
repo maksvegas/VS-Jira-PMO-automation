@@ -229,6 +229,26 @@ def fetch_legacy(base: str, email: str, token: str, jql: str, req_fields: List[s
         start_at += len(batch)
     return out
 
+# ------------- Fallback fetch -------------
+
+def fetch_parent_fields_individually(base: str, email: str, token: str, keys: list, fields: list, debug: bool=False) -> dict:
+    """Fetch parent fields one-by-one via GET /issue/{key}?fields=... (robust fallback)."""
+    headers, auth = jira_auth(email, token)
+    out = {}
+    for k in keys:
+        try:
+            url = f"{base}/rest/api/3/issue/{k}?fields={','.join(fields)}"
+            r = requests.get(url, headers=headers, auth=auth, timeout=45)
+            if r.status_code == 200:
+                data = r.json()
+                flds = (data.get("fields") or {})
+                out[k] = {fld: flds.get(fld) for fld in fields}
+            else:
+                if debug: print(f"Fallback GET /issue/{k} failed: {r.status_code}")
+        except Exception as e:
+            if debug: print(f"Fallback GET /issue/{k} exception: {e}")
+    return out
+
 # ------------- Enrichment -------------
 
 def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[Dict[str, Any]],
@@ -270,6 +290,33 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
                 if "rank" in meta: parent["_rank_cache"] = meta.get("rank", parent.get("_rank_cache", None))
                 if "epic_rank" in meta: parent["_epic_rank_cache"] = meta.get("epic_rank", parent.get("_epic_rank_cache", None))
                 if "priority_num" in meta: parent["_priority_num_cache"] = meta.get("priority_num", parent.get("_priority_num_cache", None))
+
+        # Fallback: any parents still missing priority/rank? fetch via GET /issue/{key}
+        missing = set()
+        for iss in issues:
+            p = (iss.get("fields") or {}).get("parent")
+            if isinstance(p, dict) and p.get("key"):
+                need_prio = parent_priority_field and p.get("_priority_num_cache") in (None, "", [])
+                need_rank = parent_rank_field and p.get("_rank_cache") in (None, "", [])
+                need_epic = epic_rank_field and p.get("_epic_rank_cache") in (None, "", [])
+                if need_prio or need_rank or need_epic:
+                    missing.add(p["key"])
+
+        if missing:
+            want_fields = ["summary"]
+            if parent_priority_field: want_fields.append(parent_priority_field)
+            if parent_rank_field: want_fields.append(parent_rank_field)
+            if epic_rank_field: want_fields.append(epic_rank_field)
+            if debug: print(f"Parent enrichment fallback: fetching individually for {len(missing)} parents: {sorted(list(missing))[:10]}{'...' if len(missing)>10 else ''}")
+            per = fetch_parent_fields_individually(base, email, token, sorted(list(missing)), want_fields, debug=debug)
+            for iss in issues:
+                p = (iss.get("fields") or {}).get("parent")
+                if isinstance(p, dict) and p.get("key") and p["key"] in per:
+                    pf = per[p["key"]]
+                    p["_summary_cache"] = pf.get("summary", p.get("_summary_cache",""))
+                    if parent_priority_field: p["_priority_num_cache"] = pf.get(parent_priority_field, p.get("_priority_num_cache", None))
+                    if parent_rank_field: p["_rank_cache"] = pf.get(parent_rank_field, p.get("_rank_cache", None))
+                    if epic_rank_field: p["_epic_rank_cache"] = pf.get(epic_rank_field, p.get("_epic_rank_cache", None))
     except Exception:
         return
 
