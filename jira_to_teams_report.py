@@ -390,7 +390,7 @@ def build_list_markdown(issues: List[Dict[str, Any]], fields: List[str], tzname:
                     if val: parts.append(f"Status: {val}")
                 elif name == "assignee":
                     who = format_val(it, "assignee", tzname, datefmt)
-                    if who: parts.append(f"**Assignee**: {who}")
+                    if who: parts.append(f"Assignee: **{who}**")
                 elif name == "updated":
                     val = format_val(it, "updated", tzname, datefmt)
                     if val: parts.append(f"Updated: {val}")
