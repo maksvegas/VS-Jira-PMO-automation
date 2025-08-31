@@ -1,23 +1,18 @@
 #!/usr/bin/env python3
 """
-jira_to_teams_report.py (enhanced-compatible + parentSummary support)
+jira_to_teams_report.py (grouped + parentSummary + safer Teams send)
 
-Features:
-- Uses enhanced JQL search (POST /rest/api/3/search/jql) with nextPageToken pagination.
-- Optional fallback to legacy search (POST /rest/api/3/search).
-- Posts Markdown to Microsoft Teams Incoming Webhook (accept any 2xx, including 202).
-- Supports virtual field "parentSummary" (or "parent_summary").
-  * If Jira embeds parent.fields.summary, use it.
-  * Otherwise, bulk fetch parent summaries in a single extra API call and inject them.
+Adds reliability features for Teams:
+- TEAMS_MESSAGE_MODE: "card" (default) or "plain"
+  * card: O365 MessageCard payload (legacy connector schema)
+  * plain: {"text": "..."} minimal payload
+- TEAMS_PROBE: "true" (default) -> sends a tiny probe message first
+- TEAMS_CHUNK_LIMIT: character limit per chunk (default 10000)
 
-Environment variables (required):
-  JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_JQL, JIRA_FIELDS, TEAMS_WEBHOOK_URL
-
-Optional env:
-  TITLE, DATE_FORMAT, TIMEZONE, MAX_ISSUES, BATCH_SIZE
-  JIRA_USE_LEGACY="true"      -> force legacy endpoint
-  EXPAND="changelog,renderedFields"
-  RECONCILE_ISSUE_IDS="10001,10042"  -> enhanced-only strong consistency (numeric IDs)
+Other features preserved:
+- Enhanced JQL search + legacy fallback
+- parentSummary enrichment
+- Group-by-parent sections
 """
 
 import os
@@ -33,27 +28,31 @@ try:
 except Exception:
     ZoneInfo = None
 
-CONFIG = {
-    "JIRA_BASE_URL": "https://your-domain.atlassian.net",
-    "JIRA_EMAIL": "you@example.com",
-    "JIRA_API_TOKEN": "YOUR_API_TOKEN",
-    "JIRA_JQL": "project = ABC ORDER BY updated DESC",
-    "JIRA_FIELDS": ["key", "summary", "parentSummary", "status", "assignee", "updated"],
-    "TEAMS_WEBHOOK_URL": "https://outlook.office.com/webhook/your-webhook-url",
+# ----------------- (imports for types used in helpers) -----------------
+from typing import List, Dict, Any  # re-import for static hints
+
+# ------- Config Defaults (non-secret) -------
+DEFAULTS = {
     "TITLE": "Jira Report",
     "DATE_FORMAT": "%Y-%m-%d %H:%M",
     "TIMEZONE": "UTC",
-    "MAX_ISSUES": 500,
-    "BATCH_SIZE": 100,
+    "MAX_ISSUES": "500",
+    "BATCH_SIZE": "100",
     "JIRA_USE_LEGACY": "false",
     "EXPAND": "",
     "RECONCILE_ISSUE_IDS": "",
+    "GROUP_BY_PARENT": "true",
+    "GROUP_STRIP_PARENT_SUMMARY": "true",
+    # Teams reliability knobs
+    "TEAMS_MESSAGE_MODE": "card",   # "card" or "plain"
+    "TEAMS_PROBE": "true",
+    "TEAMS_CHUNK_LIMIT": "10000",
 }
 
-# ---------------- Helpers ----------------
-
-def env_or_config(name: str, default=None):
-    return os.getenv(name, CONFIG.get(name, default))
+def getenv(name: str, fallback_key: Optional[str] = None):
+    if fallback_key is None:
+        fallback_key = name
+    return os.getenv(name, DEFAULTS.get(fallback_key))
 
 def parse_bool(v: Optional[str], default=False) -> bool:
     if v is None:
@@ -71,10 +70,6 @@ def parse_reconcile_ids(csv: str) -> Optional[List[int]]:
     return ids or None
 
 def compute_request_fields(fields: List[str]) -> List[str]:
-    """Prepare the fields array for Jira API request.
-       - remove 'key' (it's top-level)
-       - auto-include 'parent' when parentSummary is requested
-    """
     req = [f for f in fields if f.lower() != "key"]
     if any(f.lower() in {"parentsummary", "parent_summary"} for f in fields):
         if "parent" not in {x.lower() for x in req}:
@@ -98,7 +93,7 @@ def format_date(dt_str: str, tzname: str, fmt: str) -> str:
 def jira_auth(email: str, token: str):
     return {"Accept": "application/json", "Content-Type": "application/json"}, (email, token)
 
-# ------------- Fetch (Enhanced + Legacy) -------------
+# ----------- Fetchers -----------
 
 def fetch_enhanced(base: str, email: str, token: str, jql: str, fields: List[str],
                    max_issues: int, batch_size: int, expand: str,
@@ -120,9 +115,9 @@ def fetch_enhanced(base: str, email: str, token: str, jql: str, fields: List[str
             "fields": req_fields,
         }
         if expand:
-            payload["expand"] = expand   # string (enhanced schema)
+            payload["expand"] = expand
         if reconcile_ids:
-            payload["reconcileIssues"] = reconcile_ids  # array<int>
+            payload["reconcileIssues"] = reconcile_ids
         if next_token:
             payload["nextPageToken"] = next_token
 
@@ -170,50 +165,38 @@ def fetch_legacy(base: str, email: str, token: str, jql: str, fields: List[str],
         start_at += len(issues)
     return out
 
-# ------------- Parent Summary Support -------------
+# ----------- Parent summaries -----------
 
 def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[Dict[str, Any]]) -> None:
-    """Find parents without embedded summary and fetch their summaries in one call.
-       Injects a lightweight cache onto the issue object so extract_field can read it.
-    """
     want_keys = set()
     for iss in issues:
-        fields = iss.get("fields") or {}
-        parent = fields.get("parent")
+        f = iss.get("fields") or {}
+        parent = f.get("parent")
         if isinstance(parent, dict):
             embedded = isinstance(parent.get("fields"), dict) and parent["fields"].get("summary")
             if not embedded and parent.get("key"):
                 want_keys.add(parent["key"])
-
     if not want_keys:
         return
 
-    jql = "key in (" + ",".join(sorted(want_keys)) + ")"
     url = f"{base}/rest/api/3/search"
     headers, auth = jira_auth(email, token)
-    payload = {
-        "jql": jql,
-        "fields": ["summary"],
-        "maxResults": len(want_keys),
-    }
+    payload = {"jql": "key in (" + ",".join(sorted(want_keys)) + ")", "fields": ["summary"], "maxResults": len(want_keys)}
     try:
         resp = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload), timeout=60)
         if resp.status_code != 200:
             return
         data = resp.json()
         by_key = {it.get("key"): (it.get("fields") or {}).get("summary", "") for it in data.get("issues", [])}
-
-        # Inject cache
         for iss in issues:
-            fields = iss.get("fields") or {}
-            parent = fields.get("parent")
+            f = iss.get("fields") or {}
+            parent = f.get("parent")
             if isinstance(parent, dict) and parent.get("key"):
                 parent["_summary_cache"] = by_key.get(parent["key"], parent.get("_summary_cache", ""))
     except Exception:
-        # Fail-soft on enrichment to not block the report
         return
 
-# ------------- Field extraction + formatting -------------
+# ----------- Rendering -----------
 
 def extract_field(issue: Dict[str, Any], field: str, tzname: str, datefmt: str) -> str:
     f = field.lower()
@@ -232,7 +215,6 @@ def extract_field(issue: Dict[str, Any], field: str, tzname: str, datefmt: str) 
     if f in {"updated", "created", "duedate", "resolutiondate"}:
         return format_date(fields.get(field) or fields.get(f), tzname, datefmt)
 
-    # Virtual field parentSummary / parent_summary
     if f in {"parentsummary", "parent_summary"}:
         parent = fields.get("parent") or {}
         if isinstance(parent, dict):
@@ -241,7 +223,6 @@ def extract_field(issue: Dict[str, Any], field: str, tzname: str, datefmt: str) 
             return parent.get("_summary_cache", "")
         return ""
 
-    # Generic handling (custom fields etc.)
     val = fields.get(field) or fields.get(f)
     if isinstance(val, dict):
         for k in ("displayName", "name", "value", "id"):
@@ -271,28 +252,20 @@ def build_markdown_table(issues: List[Dict[str, Any]], fields: List[str], tzname
     return "\n".join(rows)
 
 def group_issues_by_parent(issues: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    """Group issues by parent key.
-       Returns: { parent_key_or_none: {"title": parent_summary_or_empty, "issues": [issue,...]} }
-    """
     groups: Dict[str, Dict[str, Any]] = {}
     for iss in issues:
         f = iss.get("fields") or {}
         parent = f.get("parent")
         if isinstance(parent, dict):
             pkey = parent.get("key") or "NO_PARENT"
-            ptitle = ""
-            # Prefer embedded parent summary, else cached
             if isinstance(parent.get("fields"), dict) and parent["fields"].get("summary"):
                 ptitle = parent["fields"]["summary"]
             else:
                 ptitle = parent.get("_summary_cache", "")
         else:
-            pkey = "NO_PARENT"
-            ptitle = ""
-
+            pkey = "NO_PARENT"; ptitle = ""
         if pkey not in groups:
             groups[pkey] = {"title": ptitle, "issues": []}
-        # If any later issue has a better title, keep the non-empty one
         if ptitle and not groups[pkey]["title"]:
             groups[pkey]["title"] = ptitle
         groups[pkey]["issues"].append(iss)
@@ -300,15 +273,9 @@ def group_issues_by_parent(issues: List[Dict[str, Any]]) -> Dict[str, Dict[str, 
 
 def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzname: str, datefmt: str,
                            strip_parent_summary: bool = True) -> str:
-    """Render grouped sections by parent, each with its own table.
-       If strip_parent_summary=True, remove parentSummary from per-group tables
-       since the parent title is in the section header.
-    """
     if not issues:
         return "_No issues found for the given JQL._"
     groups = group_issues_by_parent(issues)
-
-    # Prepare fields per group
     fields_local = list(fields)
     if strip_parent_summary:
         fields_local = [f for f in fields_local if f.lower() not in {"parentsummary","parent_summary"}]
@@ -320,13 +287,9 @@ def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzna
         if pkey == "NO_PARENT":
             heading = "**No Parent**"
         else:
-            if title:
-                heading = f"**{pkey} — {title}**"
-            else:
-                heading = f"**{pkey}**"
-
+            heading = f"**{pkey} — {title}**" if title else f"**{pkey}**"
         sections.append(heading)
-        # Render a small table for this group's issues
+
         header = " | ".join(fields_local)
         sep = " | ".join(["---"] * len(fields_local))
         rows = [header, sep]
@@ -335,6 +298,94 @@ def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzna
             vals = [v.replace("|", "\\|") for v in vals]
             rows.append(" | ".join(vals))
         sections.append("\n".join(rows))
-
     return "\n\n".join(sections)
 
+def chunk_text(text: str, max_len: int) -> List[str]:
+    if len(text) <= max_len:
+        return [text]
+    chunks, current, n = [], [], 0
+    for line in text.splitlines(False):
+        if n + len(line) + 1 > max_len:
+            chunks.append("\n".join(current)); current, n = [line], len(line) + 1
+        else:
+            current.append(line); n += len(line) + 1
+    if current: chunks.append("\n".join(current))
+    return chunks
+
+# ----------- Teams posting -----------
+
+def post_to_teams(webhook_url: str, title: str, markdown_text: str, mode: str = "card") -> None:
+    if mode == "plain":
+        payload = {"text": f"**{title}**\n\n{markdown_text}"}
+    else:
+        payload = {
+            "@type": "MessageCard",
+            "@context": "http://schema.org/extensions",
+            "summary": title,
+            "themeColor": "0076D7",
+            "title": title,
+            "text": markdown_text
+        }
+    resp = requests.post(webhook_url, json=payload, timeout=45)
+    print(f"Teams response: {resp.status_code}")
+    if not (200 <= resp.status_code < 300):
+        raise RuntimeError(f"Teams webhook error {resp.status_code}: {resp.text}")
+
+# ---------------- Main ----------------
+
+def main():
+    base = os.getenv("JIRA_BASE_URL")
+    email = os.getenv("JIRA_EMAIL")
+    token = os.getenv("JIRA_API_TOKEN")
+    jql = os.getenv("JIRA_JQL")
+    fields_csv = os.getenv("JIRA_FIELDS")
+    webhook = os.getenv("TEAMS_WEBHOOK_URL")
+
+    title = getenv("TITLE")
+    datefmt = getenv("DATE_FORMAT")
+    tzname = getenv("TIMEZONE")
+    max_issues = int(getenv("MAX_ISSUES"))
+    batch_size = int(getenv("BATCH_SIZE"))
+    use_legacy = parse_bool(getenv("JIRA_USE_LEGACY"), default=False)
+    expand = getenv("EXPAND") or ""
+    reconcile_ids = parse_reconcile_ids(getenv("RECONCILE_ISSUE_IDS") or "")
+    group_by_parent = parse_bool(getenv("GROUP_BY_PARENT"), default=True)
+    strip_parent_summary = parse_bool(getenv("GROUP_STRIP_PARENT_SUMMARY"), default=True)
+
+    teams_mode = (getenv("TEAMS_MESSAGE_MODE") or "card").strip().lower()
+    teams_probe = parse_bool(getenv("TEAMS_PROBE"), default=True)
+    teams_chunk_limit = int(getenv("TEAMS_CHUNK_LIMIT"))
+
+    missing = [n for n, v in [("JIRA_BASE_URL", base), ("JIRA_EMAIL", email), ("JIRA_API_TOKEN", token),
+                               ("JIRA_JQL", jql), ("TEAMS_WEBHOOK_URL", webhook), ("JIRA_FIELDS", fields_csv)] if not v]
+    if missing:
+        print("Missing required configuration values:", ", ".join(missing), file=sys.stderr)
+        sys.exit(2)
+
+    fields = [s.strip() for s in fields_csv.split(",")]
+
+    print(f"Querying Jira with JQL: {jql}")
+    if use_legacy:
+        issues = fetch_legacy(base, email, token, jql, fields, max_issues, batch_size, expand)
+    else:
+        issues = fetch_enhanced(base, email, token, jql, fields, max_issues, batch_size, expand, reconcile_ids)
+
+    if any(f.lower() in {"parentsummary", "parent_summary"} for f in fields):
+        bulk_fill_parent_summaries(base, email, token, issues)
+
+    print(f"Fetched {len(issues)} issues")
+    body = build_grouped_markdown(issues, fields, tzname, datefmt, strip_parent_summary) if group_by_parent \
+           else build_markdown_table(issues, fields, tzname, datefmt)
+
+    # Probe first (helps catch bad webhook/channel setup)
+    if teams_probe:
+        post_to_teams(webhook, f"{title} (probe)", "Probe: webhook reachable ✅", mode=teams_mode)
+
+    # Chunk and send
+    for i, chunk in enumerate(chunk_text(body, teams_chunk_limit), 1):
+        chunk_title = title if i == 1 and len(body) == len(chunk) else f"{title} (part {i})"
+        post_to_teams(webhook, chunk_title, chunk, mode=teams_mode)
+        print(f"Posted chunk {i} to Teams")
+
+if __name__ == "__main__":
+    main()
