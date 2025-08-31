@@ -52,3 +52,14 @@ jobs:
           # Temporary: print ordering to logs
           DEBUG_ORDER: "true"
         run: python jira_to_teams_report.py
+      - name: Probe one parent for Priority Rank
+        env:
+          JIRA_BASE_URL: ${{ secrets.JIRA_BASE_URL }}
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+        run: |
+          set -e
+          KEY="PMO-200"   # change to one of your parent keys
+          curl -s -u "$JIRA_EMAIL:$JIRA_API_TOKEN" \
+            -H "Accept: application/json" \
+            "$JIRA_BASE_URL/rest/api/3/issue/$KEY?fields=customfield_10487,summary,issuetype" | jq .
