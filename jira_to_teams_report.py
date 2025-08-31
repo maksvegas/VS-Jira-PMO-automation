@@ -1,27 +1,19 @@
 #!/usr/bin/env python3
 """
-jira_to_teams_report.py (parent grouping by Rank + child issue Rank sorting)
+jira_to_teams_report.py (sorted by parent rank + child rank) — fixed
 
-Key features
-- Enhanced JQL search (POST /rest/api/3/search/jql) + legacy fallback
+Fixes:
+- Parent group ordering now uses the configured PARENT_RANK_FIELD everywhere
+  (no hardcoded field IDs).
+
+Extras:
+- DEBUG_ORDER="true" prints the parent group order with ranks and sample child ranks.
+
+Features Recap:
+- Enhanced JQL search + legacy fallback
 - Teams webhook posting (accept any 2xx)
-- parentSummary enrichment (bulk one-call fetch when missing)
-- Group-by-parent, groups ordered by **parent Rank (LexoRank)**; "No Parent" last
-- **NEW:** Sort issues within each parent group by their own **issue Rank**
-
-Env (required):
-  JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_JQL, JIRA_FIELDS, TEAMS_WEBHOOK_URL
-
-Env (optional):
-  TITLE, DATE_FORMAT, TIMEZONE, MAX_ISSUES, BATCH_SIZE
-  JIRA_USE_LEGACY="true"
-  EXPAND="changelog,renderedFields"
-  RECONCILE_ISSUE_IDS="10001,10042"
-  GROUP_BY_PARENT="true"
-  GROUP_STRIP_PARENT_SUMMARY="true"
-  PARENT_RANK_FIELD="customfield_10019"   # parent Rank field (default Jira Cloud Rank)
-  ISSUE_RANK_FIELD="customfield_10019"    # child issue Rank field (usually same as parent)
-  SORT_CHILDREN_BY_RANK="true"            # sort issues within each parent by issue Rank
+- parentSummary enrichment (bulk one-call fetch)
+- Group-by-parent; groups ordered by parent Rank; issues ordered by issue Rank
 """
 
 import os
@@ -54,9 +46,10 @@ CONFIG = {
     "RECONCILE_ISSUE_IDS": "",
     "GROUP_BY_PARENT": "true",
     "GROUP_STRIP_PARENT_SUMMARY": "true",
-    "PARENT_RANK_FIELD": "customfield_10019",
-    "ISSUE_RANK_FIELD": "customfield_10019",
+    "PARENT_RANK_FIELD": "customfield_10015",
+    "ISSUE_RANK_FIELD": "customfield_10015",
     "SORT_CHILDREN_BY_RANK": "true",
+    "DEBUG_ORDER": "false",
 }
 
 # ---------------- Helpers ----------------
@@ -80,23 +73,15 @@ def parse_reconcile_ids(csv: str) -> Optional[List[int]]:
     return ids or None
 
 def compute_request_fields(fields: List[str]) -> List[str]:
-    """Prepare the fields array for Jira API request.
-       - remove 'key' (it's top-level)
-       - auto-include 'parent' when parentSummary is requested or when grouping by parent
-       - auto-include issue Rank field if we intend to sort children by rank
-    """
     req = [f for f in fields if f.lower() != "key"]
-
     group_by_parent = parse_bool(env_or_config("GROUP_BY_PARENT") or "true", default=True)
     if any(f.lower() in {"parentsummary", "parent_summary"} for f in fields) or group_by_parent:
         if "parent" not in {x.lower() for x in req}:
             req.append("parent")
-
     if parse_bool(env_or_config("SORT_CHILDREN_BY_RANK") or "true", default=True):
-        issue_rank_field = env_or_config("ISSUE_RANK_FIELD") or "customfield_10019"
+        issue_rank_field = env_or_config("ISSUE_RANK_FIELD") or "customfield_10015"
         if issue_rank_field not in req:
             req.append(issue_rank_field)
-
     return req
 
 def format_date(dt_str: str, tzname: str, fmt: str) -> str:
@@ -116,7 +101,7 @@ def format_date(dt_str: str, tzname: str, fmt: str) -> str:
 def jira_auth(email: str, token: str):
     return {"Accept": "application/json", "Content-Type": "application/json"}, (email, token)
 
-# ------------- Fetch (Enhanced + Legacy) -------------
+# ------------- Fetch -------------
 
 def fetch_enhanced(base: str, email: str, token: str, jql: str, fields: List[str],
                    max_issues: int, batch_size: int, expand: str,
@@ -138,9 +123,9 @@ def fetch_enhanced(base: str, email: str, token: str, jql: str, fields: List[str
             "fields": req_fields,
         }
         if expand:
-            payload["expand"] = expand   # string (enhanced schema)
+            payload["expand"] = expand
         if reconcile_ids:
-            payload["reconcileIssues"] = reconcile_ids  # array<int>
+            payload["reconcileIssues"] = reconcile_ids
         if next_token:
             payload["nextPageToken"] = next_token
 
@@ -188,12 +173,9 @@ def fetch_legacy(base: str, email: str, token: str, jql: str, fields: List[str],
         start_at += len(issues)
     return out
 
-# ------------- Parent Summary + Rank Enrichment -------------
+# ------------- Enrichment -------------
 
 def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[Dict[str, Any]], parent_rank_field: str) -> None:
-    """Find parents without embedded summary and fetch their summaries + rank in one call.
-       Injects _summary_cache and _rank_cache onto the parent objects.
-    """
     want_keys = set()
     for iss in issues:
         fields = iss.get("fields") or {}
@@ -202,18 +184,13 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
             embedded = isinstance(parent.get("fields"), dict) and parent["fields"].get("summary")
             if not embedded and parent.get("key"):
                 want_keys.add(parent["key"])
-
     if not want_keys:
         return
 
     jql = "key in (" + ",".join(sorted(want_keys)) + ")"
     url = f"{base}/rest/api/3/search"
     headers, auth = jira_auth(email, token)
-    payload = {
-        "jql": jql,
-        "fields": ["summary", parent_rank_field],
-        "maxResults": len(want_keys),
-    }
+    payload = {"jql": jql, "fields": ["summary", parent_rank_field], "maxResults": len(want_keys)}
     try:
         resp = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload), timeout=60)
         if resp.status_code != 200:
@@ -221,27 +198,20 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
         data = resp.json()
         by_key: Dict[str, Dict[str, Any]] = {}
         for it in data.get("issues", []):
-            k = it.get("key")
-            flds = it.get("fields") or {}
-            by_key[k] = {
-                "summary": flds.get("summary", ""),
-                "rank": flds.get(parent_rank_field)
-            }
-
+            k = it.get("key"); flds = it.get("fields") or {}
+            by_key[k] = {"summary": flds.get("summary", ""), "rank": flds.get(parent_rank_field)}
         for iss in issues:
             fields = iss.get("fields") or {}
             parent = fields.get("parent")
             if isinstance(parent, dict) and parent.get("key"):
                 meta = by_key.get(parent["key"], {})
                 if isinstance(meta, dict):
-                    if "summary" in meta:
-                        parent["_summary_cache"] = meta.get("summary", parent.get("_summary_cache", ""))
-                    if "rank" in meta:
-                        parent["_rank_cache"] = meta.get("rank", parent.get("_rank_cache", None))
+                    parent["_summary_cache"] = meta.get("summary", parent.get("_summary_cache", ""))
+                    parent["_rank_cache"] = meta.get("rank", parent.get("_rank_cache", None))
     except Exception:
         return
 
-# ------------- Rendering (grouped; parent rank order; child rank order) -------------
+# ------------- Rendering -------------
 
 def extract_field(issue: Dict[str, Any], field: str, tzname: str, datefmt: str) -> str:
     f = field.lower()
@@ -284,21 +254,21 @@ def extract_field(issue: Dict[str, Any], field: str, tzname: str, datefmt: str) 
         return ", ".join([s for s in simple if s])
     return "" if val is None else str(val)
 
-def group_issues_by_parent(issues: List[Dict[str, Any]], issue_rank_field: str) -> Dict[str, Dict[str, Any]]:
+def group_issues_by_parent(issues: List[Dict[str, Any]], issue_rank_field: str, parent_rank_field: str) -> Dict[str, Dict[str, Any]]:
     groups: Dict[str, Dict[str, Any]] = {}
     for iss in issues:
         f = iss.get("fields") or {}
         parent = f.get("parent")
         if isinstance(parent, dict):
             pkey = parent.get("key") or "NO_PARENT"
-            # parent title
+            # title
             if isinstance(parent.get("fields"), dict) and parent["fields"].get("summary"):
                 ptitle = parent["fields"]["summary"]
             else:
                 ptitle = parent.get("_summary_cache", "")
-            # parent rank (try embedded default rank field or cached)
+            # rank (embedded field or cached)
             pf = parent.get("fields") or {}
-            prank = pf.get("customfield_10019") or parent.get("_rank_cache", "")
+            prank = pf.get(parent_rank_field) or parent.get("_rank_cache", "")
         else:
             pkey = "NO_PARENT"; ptitle = ""; prank = ""
         if pkey not in groups:
@@ -307,7 +277,7 @@ def group_issues_by_parent(issues: List[Dict[str, Any]], issue_rank_field: str) 
             groups[pkey]["title"] = ptitle
         if prank and not groups[pkey].get("rank"):
             groups[pkey]["rank"] = prank
-        # capture child rank for later sorting
+        # child rank capture
         child_rank = (f.get(issue_rank_field) or "")
         iss["_child_rank_cache"] = child_rank
         groups[pkey]["issues"].append(iss)
@@ -326,23 +296,36 @@ def build_markdown_table(issues: List[Dict[str, Any]], fields: List[str], tzname
     return "\n".join(rows)
 
 def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzname: str, datefmt: str,
-                           strip_parent_summary: bool = True, issue_rank_field: str = "customfield_10019") -> str:
+                           strip_parent_summary: bool = True, issue_rank_field: str = "customfield_10015",
+                           parent_rank_field: str = "customfield_10015", debug=False) -> str:
     if not issues:
         return "_No issues found for the given JQL._"
-    groups = group_issues_by_parent(issues, issue_rank_field)
+    groups = group_issues_by_parent(issues, issue_rank_field, parent_rank_field)
     fields_local = list(fields)
     if strip_parent_summary:
         fields_local = [f for f in fields_local if f.lower() not in {"parentsummary","parent_summary"}]
 
     def sort_group_key(k: str):
-        # "NO_PARENT" groups last; otherwise by parent rank (lexicographically)
         if k == "NO_PARENT":
             return (1, "", k)
         rank = groups[k].get("rank", "")
         return (0, rank or "~", k)
 
+    ordered_keys = sorted(groups.keys(), key=sort_group_key)
+
+    if debug:
+        print("Parent group order:")
+        for k in ordered_keys:
+            meta = groups[k]
+            print(f"  {k}: rank={meta.get('rank','')} title={meta.get('title','')} size={len(meta['issues'])}")
+        # Show a couple of child ranks for the first group
+        if ordered_keys:
+            first = ordered_keys[0]
+            sample = [i.get('_child_rank_cache') for i in groups[first]['issues'][:5]]
+            print(f"Sample child ranks for {first}: {sample}")
+
     sections = []
-    for pkey in sorted(groups.keys(), key=sort_group_key):
+    for pkey in ordered_keys:
         meta = groups[pkey]
         title = meta.get("title") or ""
         if pkey == "NO_PARENT":
@@ -351,7 +334,6 @@ def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzna
             heading = f"**{pkey} — {title}**" if title else f"**{pkey}**"
         sections.append(heading)
 
-        # Sort children by their rank (lexicographically); fallback by key
         children = list(meta["issues"])
         children.sort(key=lambda it: (it.get("_child_rank_cache") or "~", it.get("key") or ""))
 
@@ -378,14 +360,8 @@ def chunk_text(text: str, max_len: int = 20000) -> List[str]:
     return chunks
 
 def post_to_teams(webhook_url: str, title: str, markdown_text: str) -> None:
-    payload = {
-        "@type": "MessageCard",
-        "@context": "http://schema.org/extensions",
-        "summary": title,
-        "themeColor": "0076D7",
-        "title": title,
-        "text": markdown_text
-    }
+    payload = {"@type": "MessageCard", "@context": "http://schema.org/extensions",
+               "summary": title, "themeColor": "0076D7", "title": title, "text": markdown_text}
     resp = requests.post(webhook_url, json=payload, timeout=45)
     if not (200 <= resp.status_code < 300):
         raise RuntimeError(f"Teams webhook error {resp.status_code}: {resp.text}")
@@ -410,9 +386,10 @@ def main():
     reconcile_ids = parse_reconcile_ids(env_or_config("RECONCILE_ISSUE_IDS") or "")
     group_by_parent = parse_bool(env_or_config("GROUP_BY_PARENT") or "true", default=True)
     strip_parent_summary = parse_bool(env_or_config("GROUP_STRIP_PARENT_SUMMARY") or "true", default=True)
-    parent_rank_field = env_or_config("PARENT_RANK_FIELD") or "customfield_10019"
-    issue_rank_field = env_or_config("ISSUE_RANK_FIELD") or "customfield_10019"
+    parent_rank_field = env_or_config("PARENT_RANK_FIELD") or "customfield_10015"
+    issue_rank_field = env_or_config("ISSUE_RANK_FIELD") or "customfield_10015"
     sort_children = parse_bool(env_or_config("SORT_CHILDREN_BY_RANK") or "true", default=True)
+    debug = parse_bool(env_or_config("DEBUG_ORDER") or "false", default=False)
 
     missing = [n for n, v in [("JIRA_BASE_URL", base), ("JIRA_EMAIL", email), ("JIRA_API_TOKEN", token),
                                ("JIRA_JQL", jql), ("TEAMS_WEBHOOK_URL", webhook)] if not v]
@@ -426,15 +403,19 @@ def main():
     else:
         issues = fetch_enhanced(base, email, token, jql, fields, max_issues, batch_size, expand, reconcile_ids)
 
-    # Enrich with parent summaries + rank if requested/needed
     if any(f.lower() in {"parentsummary", "parent_summary"} for f in fields) or group_by_parent:
         bulk_fill_parent_summaries(base, email, token, issues, parent_rank_field)
 
     print(f"Fetched {len(issues)} issues")
+
     if group_by_parent:
-        markdown = build_grouped_markdown(issues, fields, tzname, datefmt,
-                                          strip_parent_summary=strip_parent_summary,
-                                          issue_rank_field=issue_rank_field if sort_children else "no_sort")
+        markdown = build_grouped_markdown(
+            issues, fields, tzname, datefmt,
+            strip_parent_summary=strip_parent_summary,
+            issue_rank_field=(issue_rank_field if sort_children else "no_sort"),
+            parent_rank_field=parent_rank_field,
+            debug=debug
+        )
     else:
         markdown = build_markdown_table(issues, fields, tzname, datefmt)
 
