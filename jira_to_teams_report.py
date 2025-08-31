@@ -1,15 +1,53 @@
 #!/usr/bin/env python3
 """
-jira_to_teams_report.py — grouped Jira → Teams report (parent priority + robust enrichment)
+jira_to_teams_report.py — grouped Jira → Teams report
+Ordering: explicit > numeric priority > parent rank/epic rank > min child rank > key
 
-Parent ordering precedence:
-  1) Explicit override (PARENT_ORDER)
-  2) Parent numeric priority (PARENT_PRIORITY_FIELD; direction controlled)
-  3) Parent Rank / Epic Rank (direction controlled)
-  4) Min child Rank
-  5) Key
+Features
+- Enhanced JQL search (POST /rest/api/3/search/jql) with legacy fallback
+- Teams MessageCard posting (accepts any 2xx)
+- Parent enrichment in one call: summary + Rank + Epic Rank + numeric priority
+- Group by parent; children sorted inside each parent
+- Sorting controls:
+  • PARENT_ORDER (explicit order by keys/titles)
+  • Numeric parent priority (e.g., "Priority Rank" custom field)
+  • Parent rank / Epic rank
+  • Min child rank as fallback
+  • Configurable directions for parent rank & child rank, and numeric priority
+- Debug output to verify chosen order basis
 
-Also supports deriving parent priority from children via PARENT_PRIORITY_AGG=min|avg|max.
+Env (required)
+  JIRA_BASE_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_JQL, JIRA_FIELDS, TEAMS_WEBHOOK_URL
+
+Key Env (optional)
+  TITLE, DATE_FORMAT, TIMEZONE, MAX_ISSUES, BATCH_SIZE
+  JIRA_USE_LEGACY="true"
+  EXPAND="changelog,renderedFields"
+  RECONCILE_ISSUE_IDS="10001,10042"
+  GROUP_BY_PARENT="true"
+  GROUP_STRIP_PARENT_SUMMARY="true"
+
+  # Rank
+  AUTO_DETECT_RANK="true"
+  AUTO_DETECT_EPIC_RANK="true"
+  PARENT_RANK_FIELD="customfield_10015"
+  PARENT_EPIC_RANK_FIELD=""
+  ISSUE_RANK_FIELD="customfield_10015"
+  PARENT_RANK_DIRECTION="desc"    # top-of-board first
+  CHILD_RANK_DIRECTION="asc"
+
+  # Numeric priority fields
+  PARENT_PRIORITY_FIELD="customfield_10487"   # e.g., "Priority Rank" (numeric)
+  PARENT_PRIORITY_DIRECTION="asc"             # 1,2,3 = high→low
+  CHILD_PRIORITY_FIELD=""
+  CHILD_PRIORITY_DIRECTION="asc"
+
+  # Explicit parent override
+  PARENT_ORDER=""                              # CSV of keys or titles
+  PARENT_ORDER_MODE="auto"                     # auto|keys|titles
+
+  # Debug
+  DEBUG_ORDER="false"
 """
 
 import os, sys, json
@@ -22,15 +60,13 @@ try:
 except Exception:
     ZoneInfo = None
 
-# ---------------- Defaults ----------------
-
 CONFIG = {
-    "JIRA_BASE_URL": "",
-    "JIRA_EMAIL": "",
-    "JIRA_API_TOKEN": "",
-    "JIRA_JQL": "",
+    "JIRA_BASE_URL": "https://your-domain.atlassian.net",
+    "JIRA_EMAIL": "you@example.com",
+    "JIRA_API_TOKEN": "YOUR_API_TOKEN",
+    "JIRA_JQL": "project = ABC ORDER BY updated DESC",
     "JIRA_FIELDS": ["key", "summary", "parentSummary", "status", "assignee", "updated"],
-    "TEAMS_WEBHOOK_URL": "",
+    "TEAMS_WEBHOOK_URL": "https://outlook.office.com/webhook/your-webhook-url",
     "TITLE": "Jira Report",
     "DATE_FORMAT": "%Y-%m-%d %H:%M",
     "TIMEZONE": "UTC",
@@ -55,13 +91,11 @@ CONFIG = {
     "PARENT_PRIORITY_DIRECTION": "asc",
     "CHILD_PRIORITY_FIELD": "",
     "CHILD_PRIORITY_DIRECTION": "asc",
-    "PARENT_PRIORITY_AGG": "",  # "", "min", "avg", "max"
     # Explicit override
     "PARENT_ORDER": "",
     "PARENT_ORDER_MODE": "auto",
     # Debug
     "DEBUG_ORDER": "false",
-    "DEBUG_PARENT_PRIORITY": "false",
 }
 
 # ---------------- Helpers ----------------
@@ -175,7 +209,7 @@ def fetch_enhanced(base: str, email: str, token: str, jql: str, req_fields: List
 
 def fetch_legacy(base: str, email: str, token: str, jql: str, req_fields: List[str],
                  max_issues: int, batch_size: int, expand: str) -> List[Dict[str, Any]]:
-    url = f"{base}/rest/api/3/search"
+    url = f"{base}/rest/api/3/search/jql"
     headers, auth = jira_auth(email, token)
     out: List[Dict[str, Any]] = []
     start_at = 0
@@ -218,11 +252,8 @@ def fetch_parent_fields_individually(base: str, email: str, token: str, keys: li
 # ------------- Enrichment -------------
 
 def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[Dict[str, Any]],
-                               parent_rank_field: str, epic_rank_field: str, parent_priority_field: str = "",
-                               debug: bool = False) -> None:
-    """Fetch summary + rank(s) + numeric priority for **all** parents referenced by the issues.
-       Uses bulk /search and falls back to per-parent GET when needed.
-    """
+                               parent_rank_field: str, epic_rank_field: str, parent_priority_field: str = "") -> None:
+    """Fetch summary + rank(s) + numeric priority for **all** parents referenced by the issues."""
     want_keys = set()
     for iss in issues:
         fields = iss.get("fields") or {}
@@ -230,21 +261,17 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
         if isinstance(parent, dict) and parent.get("key"):
             want_keys.add(parent["key"])
     if not want_keys: return
-
     url = f"{base}/rest/api/3/search"
     headers, auth = jira_auth(email, token)
     fetch_fields = ["summary"]
     if parent_rank_field: fetch_fields.append(parent_rank_field)
     if epic_rank_field and epic_rank_field not in fetch_fields: fetch_fields.append(epic_rank_field)
     if parent_priority_field and parent_priority_field not in fetch_fields: fetch_fields.append(parent_priority_field)
-
     payload = {"jql": "key in (" + ",".join(sorted(want_keys)) + ")",
                "fields": fetch_fields, "maxResults": len(want_keys)}
     try:
         r = requests.post(url, headers=headers, auth=auth, data=json.dumps(payload), timeout=60)
-        if r.status_code != 200:
-            if debug: print(f"Bulk parent /search failed: {r.status_code} {r.text[:200]}")
-            return
+        if r.status_code != 200: return
         data = r.json()
         by_key: Dict[str, Dict[str, Any]] = {}
         for it in data.get("issues", []):
@@ -254,12 +281,6 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
             if epic_rank_field:   meta["epic_rank"] = flds.get(epic_rank_field)
             if parent_priority_field: meta["priority_num"] = flds.get(parent_priority_field)
             by_key[k] = meta
-
-        if debug and by_key:
-            print("Parent enrichment sample (first 10 from bulk /search):")
-            for i,(k,v) in enumerate(list(by_key.items())[:10]):
-                print(f"  {k}: priority_raw={v.get('priority_num', None)} rank={v.get('rank','')} epic_rank={v.get('epic_rank','')} summary={v.get('summary','')}")
-
         for iss in issues:
             fields = iss.get("fields") or {}
             parent = fields.get("parent")
@@ -286,12 +307,8 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
             if parent_priority_field: want_fields.append(parent_priority_field)
             if parent_rank_field: want_fields.append(parent_rank_field)
             if epic_rank_field: want_fields.append(epic_rank_field)
-            if debug: print(f"Parent enrichment fallback: GET /issue for {len(missing)} parents: {sorted(list(missing))[:10]}{'...' if len(missing)>10 else ''}")
+            if debug: print(f"Parent enrichment fallback: fetching individually for {len(missing)} parents: {sorted(list(missing))[:10]}{'...' if len(missing)>10 else ''}")
             per = fetch_parent_fields_individually(base, email, token, sorted(list(missing)), want_fields, debug=debug)
-            if debug and per:
-                print("Parent enrichment sample (first 10 from GET /issue):")
-                for i,(k,v) in enumerate(list(per.items())[:10]):
-                    print(f"  {k}: priority_raw={v.get(parent_priority_field, None)} rank={v.get(parent_rank_field,'')} epic_rank={v.get(epic_rank_field,'')}")
             for iss in issues:
                 p = (iss.get("fields") or {}).get("parent")
                 if isinstance(p, dict) and p.get("key") and p["key"] in per:
@@ -300,8 +317,7 @@ def bulk_fill_parent_summaries(base: str, email: str, token: str, issues: List[D
                     if parent_priority_field: p["_priority_num_cache"] = pf.get(parent_priority_field, p.get("_priority_num_cache", None))
                     if parent_rank_field: p["_rank_cache"] = pf.get(parent_rank_field, p.get("_rank_cache", None))
                     if epic_rank_field: p["_epic_rank_cache"] = pf.get(epic_rank_field, p.get("_epic_rank_cache", None))
-    except Exception as e:
-        if debug: print(f"bulk_fill_parent_summaries exception: {e}")
+    except Exception:
         return
 
 # ------------- Rendering -------------
@@ -424,27 +440,11 @@ def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzna
                            parent_order: str = "", parent_order_mode: str = "auto",
                            parent_priority_field: str = "", child_priority_field: str = "",
                            parent_priority_dir: str = "asc", child_priority_dir: str = "asc",
-                           parent_priority_agg: str = "",
-                           debug=False, debug_parent=False) -> str:
+                           debug=False) -> str:
     if not issues:
         return "_No issues found for the given JQL._"
     groups = group_issues_by_parent(issues, issue_rank_field, parent_rank_field, epic_rank_field, use_epic_rank,
                                     parent_priority_field=parent_priority_field, child_priority_field=child_priority_field)
-
-    # Optionally derive parent priority from children if missing
-    if parent_priority_agg in {"min", "avg", "max"}:
-        for k, meta in groups.items():
-            if meta.get("priority") is None:
-                vals = [i.get("_child_priority_cache") for i in meta["issues"] if i.get("_child_priority_cache") is not None]
-                if vals:
-                    if parent_priority_agg == "min":
-                        meta["priority"] = min(vals)
-                    elif parent_priority_agg == "max":
-                        meta["priority"] = max(vals)
-                    else:
-                        meta["priority"] = sum(vals)/len(vals)
-        if debug_parent:
-            print(f"Applied PARENT_PRIORITY_AGG={parent_priority_agg} for parents lacking numeric priority.")
 
     # explicit order map
     order_map = {}
@@ -529,7 +529,7 @@ def build_grouped_markdown(issues: List[Dict[str, Any]], fields: List[str], tzna
             vals = [v.replace("|", "\\|") for v in vals]
             rows.append(" | ".join(vals))
         sections.append("\n".join(rows))
-    return "\n".join(sections)
+    return "\n\n".join(sections)
 
 def chunk_text(text: str, max_len: int = 20000) -> List[str]:
     if len(text) <= max_len: return [text]
@@ -585,15 +585,13 @@ def main():
     parent_priority_dir = (env_or_config("PARENT_PRIORITY_DIRECTION") or "asc").strip().lower()
     child_priority_field = env_or_config("CHILD_PRIORITY_FIELD") or ""
     child_priority_dir = (env_or_config("CHILD_PRIORITY_DIRECTION") or "asc").strip().lower()
-    parent_priority_agg = (env_or_config("PARENT_PRIORITY_AGG") or "").strip().lower()
 
-    # Explicit override
+    # Explicit order
     parent_order = env_or_config("PARENT_ORDER") or ""
     parent_order_mode = (env_or_config("PARENT_ORDER_MODE") or "auto").strip().lower()
 
     sort_children = parse_bool(env_or_config("SORT_CHILDREN_BY_RANK") or "true", default=True)
     debug = parse_bool(env_or_config("DEBUG_ORDER") or "false", default=False)
-    debug_parent = parse_bool(env_or_config("DEBUG_PARENT_PRIORITY") or "false", default=False)
 
     missing = [n for n, v in [("JIRA_BASE_URL", base), ("JIRA_EMAIL", email), ("JIRA_API_TOKEN", token),
                                ("JIRA_JQL", jql), ("TEAMS_WEBHOOK_URL", webhook)] if not v]
@@ -618,9 +616,9 @@ def main():
     else:
         issues = fetch_enhanced(base, email, token, jql, req_fields, max_issues, batch_size, expand, reconcile_ids)
 
-    # Enrich ALL parents (summary + rank + epic rank + numeric priority), with fallback GET
+    # Enrich ALL parents with summary + ranks + numeric priority
     if any(f.lower() in {"parentsummary", "parent_summary"} for f in fields) or group_by_parent:
-        bulk_fill_parent_summaries(base, email, token, issues, parent_rank_field, epic_rank_field, parent_priority_field, debug=debug_parent)
+        bulk_fill_parent_summaries(base, email, token, issues, parent_rank_field, epic_rank_field, parent_priority_field)
 
     print(f"Fetched {len(issues)} issues")
 
@@ -640,9 +638,7 @@ def main():
             child_priority_field=child_priority_field,
             parent_priority_dir=parent_priority_dir,
             child_priority_dir=child_priority_dir,
-            parent_priority_agg=parent_priority_agg,
-            debug=debug,
-            debug_parent=debug_parent
+            debug=debug
         )
     else:
         markdown = build_markdown_table(issues, fields, tzname, datefmt)
