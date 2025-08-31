@@ -29,7 +29,7 @@ jobs:
           # RECONCILE_ISSUE_IDS: "10001,10042"
           # JIRA_USE_LEGACY: "true"
           # reliability knobs:
-          TEAMS_MESSAGE_MODE: "adaptive"   # try "plain" first; !ada[ptive"
+          TEAMS_MESSAGE_MODE: "plain"   # try "plain" first; !ada[ptive"
           TEAMS_PROBE: "false"
           TEAMS_CHUNK_LIMIT: "10000"
           TEAMS_SINGLE_MESSAGE: "true"       # <— combine into one message/card
