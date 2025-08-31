@@ -29,9 +29,11 @@ jobs:
           # RECONCILE_ISSUE_IDS: "10001,10042"
           # JIRA_USE_LEGACY: "true"
           # reliability knobs:
-          TEAMS_MESSAGE_MODE: "plain"   # try "plain" first; switch back to "card" if you like
+          TEAMS_MESSAGE_MODE: "adaptive"   # try "plain" first; !ada[ptive"
           TEAMS_PROBE: "false"
           TEAMS_CHUNK_LIMIT: "10000"
+          TEAMS_SINGLE_MESSAGE: "true"       # <— combine into one message/card
+          TEAMS_ADAPTIVE_ROWS_PER_CARD: "60" # adaptive safeguard
           PARENT_PRIORITY_FIELD: "customfield_10487"
           PARENT_PRIORITY_DIRECTION: "asc"   # smaller number = higher priority
           # (optional) if you want to use same field for children too:
