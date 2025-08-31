@@ -42,6 +42,8 @@ jobs:
           GROUP_STRIP_PARENT_SUMMARY: "true"
           AUTO_DETECT_RANK: "true"   # default, but set explicitly for this test
           AUTO_DETECT_EPIC_RANK: "true"   # add this
+          PARENT_RANK_DIRECTION: "desc"   # <- new (puts top-of-board first)
+          CHILD_RANK_DIRECTION: "asc"     # leave as asc unless you prefer the reverse
           # Temporary: print ordering to logs
           DEBUG_ORDER: "true"
         run: python jira_to_teams_report.py
