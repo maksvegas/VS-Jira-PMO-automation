@@ -23,7 +23,7 @@ jobs:
         env:
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
-          JIRA_VS: ${{ secrets.JIRA_VS }}
+          JIRA_VS: ${{ secrets.JIRA_JIRA_BASE_URL }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
           python - <<'PY'
