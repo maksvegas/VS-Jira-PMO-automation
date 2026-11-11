@@ -105,8 +105,6 @@ jobs:
               "Constraints",
               "Assumptions",
               "Success Criteria",
-              "Deliverables",
-              "Latest Status Update",
               "RAG",
 
               "Business Change Owner",
@@ -117,7 +115,6 @@ jobs:
               "Issue Category",
 
               "Risk Category",
-              "RAYG Value",
               "PMO Risk Score",
               "Risk Impact Score",
               "Risk Likelihood Score",
@@ -135,7 +132,7 @@ jobs:
                   "base_url": os.environ["JIRA_VS"].rstrip("/"),
                   "jql": """
                   key in (
-                    portfolioChildIssuesOf(PMO-207), ONPMO-207
+                    portfolioChildIssuesOf(PMO-207), PMO-207
                   )
                   and type not in (Sub-task, Story)
                   """,
@@ -340,7 +337,7 @@ jobs:
       - name: Upload weekly snapshot CSV artifact
         uses: actions/upload-artifact@v4
         with:
-          name: alabs_portfolio_snapshot_${{ env.SNAPSHOT_DATE }}
+          name: vs_portfolio_snapshot_${{ env.SNAPSHOT_DATE }}
           path: ${{ env.SNAPSHOT_FILE }}
 
       - name: Authenticate to Google Cloud
