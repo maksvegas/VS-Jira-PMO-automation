@@ -1,0 +1,361 @@
+name: VS WEEKLY SNAPSHOT TO BIGQUERY
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 7 * * 1" # Every Monday 07:00 UTC
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Jira extraction dependency
+        run: python -m pip install requests
+
+      - name: Export all portfolios into one normalized weekly snapshot CSV
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          JIRA_VS: ${{ secrets.JIRA_VS }}
+          GITHUB_RUN_ID: ${{ github.run_id }}
+        run: |
+          python - <<'PY'
+          import os, csv, base64, requests
+          from datetime import datetime, timezone
+
+          snapshot_dt = datetime.now(timezone.utc)
+          snapshot_date = snapshot_dt.strftime("%Y-%m-%d")
+          snapshot_week = snapshot_dt.strftime("%G-W%V")
+          snapshot_run_id = os.environ.get("GITHUB_RUN_ID", "")
+
+          os.makedirs("snapshots", exist_ok=True)
+
+          out_path = f"snapshots/vs_portfolio_snapshot_{snapshot_date}.csv"
+
+          with open(os.environ["GITHUB_ENV"], "a") as env:
+              env.write(f"SNAPSHOT_DATE={snapshot_date}\n")
+              env.write(f"SNAPSHOT_FILE={out_path}\n")
+
+          email = os.environ["JIRA_EMAIL"]
+          token = os.environ["JIRA_API_TOKEN"]
+
+          auth = base64.b64encode(f"{email}:{token}".encode()).decode()
+          headers = {
+              "Authorization": f"Basic {auth}",
+              "Accept": "application/json",
+          }
+
+          COMMON_FIELDS = [
+              "summary", "issuetype", "status", "priority", "assignee", "reporter",
+              "created", "updated", "duedate", "labels", "components", "parent",
+              "project", "fixVersions", "statuscategorychangedate", "description"
+          ]
+
+          CSV_HEADERS = [
+              "Snapshot Date",
+              "Snapshot Week",
+              "Snapshot Run ID",
+
+              "Source",
+              "Portfolio",
+              "Issue URL",
+              "Key",
+              "Summary",
+              "Description",
+              "Issue Type",
+              "Status",
+              "Status Category",
+              "Status Category Changed",
+              "Priority",
+              "Project key",
+              "Assignee",
+              "Assignee Id",
+              "Reporter",
+              "Reporter Id",
+              "Created",
+              "Updated",
+              "Due Date",
+              "Labels",
+              "Components",
+              "Fix Versions",
+              "Parent key",
+              "Parent summary",
+
+              "Epic Name",
+              "Rank",
+              "Target start",
+              "Target end",
+
+              "Product",
+              "T-Shirt Size",
+
+              "Latest Status Update",
+              "Product Requirements",
+              "Business Benefits",
+              "Initiative Scope",
+              "Out of Scope",
+              "Deliverables",
+              "Constraints",
+              "Assumptions",
+              "Success Criteria",
+              "Deliverables",
+              "Latest Status Update",
+              "RAG",
+
+              "Business Change Owner",
+              "Business Value",
+
+              "RAYG Value",
+              "Issue Impact Score",
+              "Issue Category",
+
+              "Risk Category",
+              "RAYG Value",
+              "PMO Risk Score",
+              "Risk Impact Score",
+              "Risk Likelihood Score",
+              "Response strategy",
+
+              "Priority Rank",
+
+          ]
+
+          # keep your CONFIGS block exactly as-is here
+          CONFIGS = [
+              {
+                  "source": "VS",
+                  "portfolio": "PMO",
+                  "base_url": os.environ["JIRA_VS"].rstrip("/"),
+                  "jql": """
+                  key in (
+                    portfolioChildIssuesOf(PMO-207), ONPMO-207
+                  )
+                  and type not in (Sub-task, Story)
+                  """,
+                  "map": {
+                      "Product": "customfield_10154",
+                      "T-Shirt Size": "customfield_10287",
+                      "Latest Status Update": "customfield_10144",
+                      "Product Requirements": "customfield_10133",
+                      "Business Benefits": "customfield_10141",
+                      "Initiative Scope": "customfield_10134",
+                      "Out of Scope": "customfield_10137",
+                      "Deliverables": "customfield_10135",
+                      "Constraints": "customfield_10136",
+                      "Assumptions": "customfield_10138",
+                      "Success Criteria": "customfield_10139",
+                      "RAG": "customfield_10353",
+                      "Business Change Owner": "customfield_10143",
+                      "Business Value": "customfield_10140",
+                      "RAYG Value": "customfield_10151",
+                      "Issue Impact Score": "customfield_10148",
+                      "Issue Category": "customfield_10153",
+                      "Risk Category": "customfield_10149",
+                      "PMO Risk Score": "customfield_10150",
+                      "Risk Impact Score": "customfield_10146",
+                      "Risk Likelihood Score": "customfield_10147",
+                      "Response strategy": "customfield_10152",
+                      "Priority Rank": "customfield_10487",
+                      "Rank": "customfield_10019",
+                      "Target start": "customfield_10022",
+                      "Target end": "customfield_10023",
+                  },
+              },
+             
+          ]
+
+          def norm_user_name(u):
+              if not u:
+                  return ""
+              return u.get("displayName") or u.get("emailAddress") or u.get("accountId") or ""
+
+          def norm_user_id(u):
+              if not u:
+                  return ""
+              return u.get("accountId") or u.get("key") or ""
+
+          def norm_list(items, key="name"):
+              if not items:
+                  return ""
+              return ";".join(
+                  i.get(key, "")
+                  for i in items
+                  if isinstance(i, dict) and i.get(key)
+              )
+
+          def norm_scalar(v):
+              if v is None:
+                  return ""
+
+              if isinstance(v, dict):
+                  return (
+                      v.get("value")
+                      or v.get("name")
+                      or v.get("key")
+                      or v.get("displayName")
+                      or v.get("accountId")
+                      or ""
+                  )
+
+              if isinstance(v, list):
+                  parts = []
+                  for item in v:
+                      if isinstance(item, dict):
+                          parts.append(
+                              item.get("value")
+                              or item.get("name")
+                              or item.get("key")
+                              or item.get("displayName")
+                              or item.get("accountId")
+                              or ""
+                          )
+                      else:
+                          parts.append(str(item))
+
+                  return ";".join(p for p in parts if p)
+
+              return str(v)
+
+          def export_config(config):
+              custom_fields = sorted(set(config["map"].values()))
+              fields = COMMON_FIELDS + custom_fields
+
+              all_rows = []
+              next_token = None
+
+              while True:
+                  params = {
+                      "jql": config["jql"].strip(),
+                      "maxResults": 100,
+                      "fields": ",".join(fields),
+                  }
+
+                  if next_token:
+                      params["nextPageToken"] = next_token
+
+                  r = requests.get(
+                      f"{config['base_url']}/rest/api/3/search/jql",
+                      headers=headers,
+                      params=params,
+                      timeout=60,
+                  )
+
+                  if not r.ok:
+                      print(f"Jira error for {config['source']} {config['portfolio']}: {r.status_code}")
+                      print(r.text)
+                      r.raise_for_status()
+
+                  data = r.json()
+
+                  for issue in data.get("issues", []):
+                      f = issue.get("fields", {}) or {}
+
+                      issue_key = issue.get("key", "")
+                      issue_url = f"{config['base_url']}/browse/{issue_key}" if issue_key else ""
+
+                      status_obj = f.get("status") or {}
+                      status_cat = (status_obj.get("statusCategory") or {}).get("name", "")
+
+                      parent_obj = f.get("parent") or {}
+                      parent_summary = (parent_obj.get("fields") or {}).get("summary", "")
+
+                      row = {header: "" for header in CSV_HEADERS}
+
+                      row.update({
+                          "Snapshot Date": snapshot_date,
+                          "Snapshot Week": snapshot_week,
+                          "Snapshot Run ID": snapshot_run_id,
+                      
+                          "Source": config["source"],
+                          "Portfolio": config["portfolio"],
+                          "Issue URL": issue_url,
+                          "Key": issue_key,
+                          "Summary": f.get("summary") or "",
+                          "Description": norm_description(f.get("description")),
+                          "Issue Type": (f.get("issuetype") or {}).get("name", ""),
+                          "Status": status_obj.get("name", ""),
+                          "Status Category": status_cat,
+                          "Status Category Changed": f.get("statuscategorychangedate") or "",
+                          "Priority": (f.get("priority") or {}).get("name", ""),
+                          "Project key": (f.get("project") or {}).get("key", ""),
+                      
+                          "Assignee": norm_user_name(f.get("assignee")),
+                          "Assignee Id": norm_user_id(f.get("assignee")),
+                          "Reporter": norm_user_name(f.get("reporter")),
+                          "Reporter Id": norm_user_id(f.get("reporter")),
+                      
+                          "Created": f.get("created") or "",
+                          "Updated": f.get("updated") or "",
+                          "Due Date": f.get("duedate") or "",
+                      
+                          "Labels": ";".join(f.get("labels") or []),
+                          "Components": norm_list(f.get("components"), "name"),
+                          "Fix Versions": norm_list(f.get("fixVersions"), "name"),
+                      
+                          "Parent key": parent_obj.get("key", ""),
+                          "Parent summary": parent_summary,
+                      })
+
+                      for csv_col, jira_field in config["map"].items():
+                          value = f.get(jira_field)
+                      
+                          if (
+                              isinstance(value, dict)
+                              and value.get("type") == "doc"
+                          ):
+                              row[csv_col] = norm_description(value)
+                          else:
+                              row[csv_col] = norm_scalar(value)
+
+
+                      all_rows.append(row)
+
+                  next_token = data.get("nextPageToken")
+                  if not next_token:
+                      break
+
+              print(f"{config['source']} {config['portfolio']}: {len(all_rows)} issues")
+              return all_rows
+
+          rows = []
+
+          for config in CONFIGS:
+              rows.extend(export_config(config))
+
+          with open(out_path, "w", newline="", encoding="utf-8") as fp:
+              writer = csv.DictWriter(fp, fieldnames=CSV_HEADERS)
+              writer.writeheader()
+              writer.writerows(rows)
+
+          print(f"Wrote {len(rows)} total issues to {out_path}")
+          PY
+
+      - name: Upload weekly snapshot CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: alabs_portfolio_snapshot_${{ env.SNAPSHOT_DATE }}
+          path: ${{ env.SNAPSHOT_FILE }}
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_SERVICE_ACCOUNT }}
+
+      - name: Install BigQuery client
+        run: python -m pip install google-cloud-bigquery
+
+      - name: Upload snapshot to BigQuery
+        env:
+          GCP_PROJECT_ID: ${{ vars.GCP_PROJECT_ID }}
+          BQ_DATASET: jira_reporting
+          BQ_TABLE: portfolio_snapshots
+          BQ_LOCATION: europe-west2
+        run: python scripts/upload_snapshot_to_bigquery.py "$SNAPSHOT_FILE"
